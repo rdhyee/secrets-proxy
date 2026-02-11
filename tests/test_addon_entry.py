@@ -173,3 +173,29 @@ class TestAddonEntryLoadConfig:
 
         with pytest.raises(KeyError):
             importlib.import_module("secrets_proxy.addon_entry")
+
+
+class TestAddonEntryScriptMode:
+    """Test addon_entry.py loads correctly via runpy.run_path (mitmdump -s mode)."""
+
+    def test_run_path_succeeds(self, monkeypatch):
+        """Regression test: addon_entry must work when loaded as a file script,
+        not just as a package import. mitmdump -s uses file execution."""
+        import runpy
+        from pathlib import Path
+
+        raw = {"KEY": {"value": "val", "hosts": ["h.com"]}}
+        config = load_config_from_dict(raw)
+        env_json = config.to_env_json()
+
+        monkeypatch.setenv("SECRETS_PROXY_CONFIG_JSON", env_json)
+
+        addon_path = str(
+            Path(__file__).resolve().parents[1]
+            / "src" / "secrets_proxy" / "addon_entry.py"
+        )
+        ns = runpy.run_path(addon_path)
+
+        assert "addons" in ns
+        assert len(ns["addons"]) == 1
+        assert "SECRETS_PROXY_CONFIG_JSON" not in os.environ

@@ -2,8 +2,8 @@
 
 Loaded by: mitmdump -s addon_entry.py
 
-Reads SECRETS_PROXY_CONFIG_JSON from the environment, builds a ProxyConfig
-via load_config_from_dict(), and instantiates the production SecretsProxyAddon.
+Reads SECRETS_PROXY_CONFIG_JSON from the environment, builds a ProxyConfig,
+and instantiates the production SecretsProxyAddon.
 This ensures all deployment paths (launcher, Docker, Sprites) use the same
 addon code with full security features (compression, JSON escaping, URL
 encoding, WebSocket blocking, Brotli fail-closed, decompression limits).
@@ -15,8 +15,8 @@ import json
 import logging
 import os
 
-from .addon import SecretsProxyAddon
-from .config import ProxyConfig, SecretEntry, load_config_from_dict
+from secrets_proxy.addon import SecretsProxyAddon
+from secrets_proxy.config import ProxyConfig, SecretEntry
 
 logger = logging.getLogger("secrets-proxy")
 

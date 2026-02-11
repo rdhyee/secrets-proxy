@@ -34,12 +34,11 @@ echo "[secrets-proxy] Starting (proxy_port=$PROXY_PORT, sandbox_uid=$SANDBOX_UID
 
 # ── Generate config + addon via secrets_proxy init ────────────
 
-SECRETS_PROXY_CONFIG_JSON=$(python3 -m secrets_proxy init \
-    --config-json "$SECRETS_PROXY_CONFIG_JSON" \
-    --sandbox-env /tmp/sandbox_env.sh)
+SECRETS_PROXY_CONFIG_JSON=$(echo "$SECRETS_PROXY_CONFIG_JSON" | \
+    python3 -m secrets_proxy init --sandbox-env /tmp/sandbox_env.sh)
 export SECRETS_PROXY_CONFIG_JSON
 
-ADDON_SCRIPT=$(python3 -c "from pathlib import Path; import secrets_proxy.addon_entry; print(Path(secrets_proxy.addon_entry.__file__).resolve())")
+ADDON_SCRIPT=$(python3 -c "from pathlib import Path; import secrets_proxy; print(Path(secrets_proxy.__file__).resolve().parent / 'addon_entry.py')")
 
 echo "[secrets-proxy] Addon configured (using production SecretsProxyAddon)"
 

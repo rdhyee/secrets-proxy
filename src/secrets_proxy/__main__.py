@@ -17,14 +17,20 @@ def _handle_init(args: argparse.Namespace) -> int:
 
     Loads config, generates placeholders, writes sandbox env file,
     prints the SECRETS_PROXY_CONFIG_JSON value to stdout.
+
+    Config can be provided via --config-json (string), --config-file (path),
+    or stdin (piped). Prefer stdin or --config-file over --config-json to
+    avoid exposing secrets in process arguments visible to `ps`.
     """
     if args.config_json:
         raw = json.loads(args.config_json)
     elif args.config_file:
         with open(args.config_file) as f:
             raw = json.load(f)
+    elif not sys.stdin.isatty():
+        raw = json.load(sys.stdin)
     else:
-        print("Error: --config-json or --config-file required", file=sys.stderr)
+        print("Error: --config-json, --config-file, or stdin required", file=sys.stderr)
         return 1
 
     config = load_config_from_dict(raw)
