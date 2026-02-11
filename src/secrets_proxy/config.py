@@ -172,6 +172,34 @@ class ProxyConfig:
             "allow_ip_literals": self.allow_ip_literals,
         })
 
+    @classmethod
+    def from_env_json(cls, env_json: str) -> "ProxyConfig":
+        """Reconstruct a ProxyConfig from the JSON produced by to_env_json().
+
+        This is the canonical deserialization path used by addon_entry.py.
+        Keeps all reconstruction logic in one place (config.py) rather than
+        having addon_entry.py manually build ProxyConfig internals.
+        """
+        data = json.loads(env_json)
+        config = cls(allow_ip_literals=data.get("allow_ip_literals", False))
+        secrets_data = data.get("secrets", {})
+        for placeholder, info in secrets_data.items():
+            entry = SecretEntry(
+                name=info["name"],
+                placeholder=placeholder,
+                value=info["value"],
+                hosts=info["hosts"],
+            )
+            config.secrets[info["name"]] = entry
+            config._placeholder_to_secret[placeholder] = entry
+            for host in info["hosts"]:
+                config.allowed_hosts.add(host)
+
+        for host in data.get("allowed_hosts", []):
+            config.allowed_hosts.add(host)
+
+        return config
+
     def find_secret_for_placeholder(
         self, text: str
     ) -> list[tuple[str, SecretEntry]]:

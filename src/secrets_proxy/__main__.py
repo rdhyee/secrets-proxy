@@ -23,28 +23,38 @@ def _handle_init(args: argparse.Namespace) -> int:
     or stdin (piped). Prefer stdin or --config-file over --config-json to
     avoid exposing secrets in process arguments visible to `ps`.
     """
-    if args.config_json:
-        raw = json.loads(args.config_json)
-    elif args.config_file:
-        with open(args.config_file) as f:
-            raw = json.load(f)
-    elif not sys.stdin.isatty():
-        raw = json.load(sys.stdin)
-    else:
-        print("Error: --config-json, --config-file, or stdin required", file=sys.stderr)
+    try:
+        if args.config_json:
+            raw = json.loads(args.config_json)
+        elif args.config_file:
+            with open(args.config_file) as f:
+                raw = json.load(f)
+        elif not sys.stdin.isatty():
+            raw = json.load(sys.stdin)
+        else:
+            print("Error: --config-json, --config-file, or stdin required", file=sys.stderr)
+            return 1
+
+        config = load_config_from_dict(raw)
+
+        # Write sandbox env file (export NAME=<shell-escaped placeholder>)
+        if args.sandbox_env:
+            with open(args.sandbox_env, "w") as f:
+                for entry in config.secrets.values():
+                    f.write(f'export {entry.name}={shlex.quote(entry.placeholder)}\n')
+
+        # Print config JSON to stdout for shell capture
+        print(config.to_env_json())
+        return 0
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid JSON: {e}", file=sys.stderr)
         return 1
-
-    config = load_config_from_dict(raw)
-
-    # Write sandbox env file (export NAME=<shell-escaped placeholder>)
-    if args.sandbox_env:
-        with open(args.sandbox_env, "w") as f:
-            for entry in config.secrets.values():
-                f.write(f'export {entry.name}={shlex.quote(entry.placeholder)}\n')
-
-    # Print config JSON to stdout for shell capture
-    print(config.to_env_json())
-    return 0
+    except (ValueError, TypeError) as e:
+        print(f"Error: invalid config: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:

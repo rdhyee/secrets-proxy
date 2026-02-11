@@ -9,7 +9,6 @@ import pytest
 
 from secrets_proxy.config import (
     ProxyConfig,
-    SecretEntry,
     load_config_from_dict,
 )
 
@@ -248,3 +247,65 @@ class TestInitSandboxEnvSafety:
             capture_output=True, text=True,
         )
         assert result.stdout == "$(touch /tmp/pwned)"
+
+
+class TestFromEnvJson:
+    """Test ProxyConfig.from_env_json() classmethod."""
+
+    def test_roundtrip_via_classmethod(self):
+        raw = {
+            "MY_KEY": {"value": "sk-real", "hosts": ["api.example.com"]},
+            "OTHER": {"value": "other-val", "hosts": ["b.com"]},
+        }
+        config = load_config_from_dict(raw)
+        env_json = config.to_env_json()
+
+        restored = ProxyConfig.from_env_json(env_json)
+        assert "MY_KEY" in restored.secrets
+        assert restored.secrets["MY_KEY"].value == "sk-real"
+        assert restored.secrets["MY_KEY"].hosts == ["api.example.com"]
+        assert "OTHER" in restored.secrets
+        assert "api.example.com" in restored.allowed_hosts
+        assert "b.com" in restored.allowed_hosts
+
+    def test_placeholder_to_secret_populated(self):
+        raw = {"KEY": {"value": "v", "hosts": ["h.com"]}}
+        config = load_config_from_dict(raw)
+        env_json = config.to_env_json()
+
+        restored = ProxyConfig.from_env_json(env_json)
+        placeholder = restored.secrets["KEY"].placeholder
+        assert placeholder in restored._placeholder_to_secret
+        assert restored._placeholder_to_secret[placeholder].name == "KEY"
+
+    def test_allow_ip_literals_roundtrip(self):
+        raw = {"KEY": {"value": "v", "hosts": ["1.2.3.4"]}}
+        config = load_config_from_dict(raw, allow_ip_literals=True)
+        restored = ProxyConfig.from_env_json(config.to_env_json())
+        assert restored.allow_ip_literals is True
+
+
+class TestInitErrorHandling:
+    """Test that init subcommand handles errors gracefully."""
+
+    def test_invalid_json_returns_error(self, capsys):
+        from secrets_proxy.__main__ import main
+
+        result = main(["init", "--config-json", "not-valid-json"])
+        assert result == 1
+        assert "invalid JSON" in capsys.readouterr().err
+
+    def test_invalid_config_returns_error(self, capsys):
+        from secrets_proxy.__main__ import main
+
+        # Missing required 'hosts' key
+        result = main(["init", "--config-json", '{"KEY": {"value": "v"}}'])
+        assert result == 1
+        assert "invalid config" in capsys.readouterr().err
+
+    def test_invalid_secret_name_returns_error(self, capsys):
+        from secrets_proxy.__main__ import main
+
+        result = main(["init", "--config-json", '{"bad;name": {"value": "v", "hosts": ["h.com"]}}'])
+        assert result == 1
+        assert "invalid config" in capsys.readouterr().err

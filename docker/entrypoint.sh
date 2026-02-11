@@ -90,6 +90,10 @@ if ! kill -0 $PROXY_PID 2>/dev/null; then
 fi
 echo "[secrets-proxy] mitmproxy started (PID $PROXY_PID, mark=0x$PROXY_MARK)"
 
+# Clear secrets from shell env — mitmproxy already consumed them at load time.
+# Without this, `su` would leak the full secret JSON to the sandbox user.
+unset SECRETS_PROXY_CONFIG_JSON
+
 # ── Set up nftables (INIT TIME — the "concrete walls") ────────
 # Uses inet family to cover both IPv4 and IPv6.
 
