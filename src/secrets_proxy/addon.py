@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import logging
 import zlib
 from typing import TYPE_CHECKING
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
     from .config import ProxyConfig, SecretEntry
 
 logger = logging.getLogger("secrets-proxy")
+MAX_DECOMPRESS_SIZE = 100 * 1024 * 1024
 
 # Check brotli availability at import time
 try:
@@ -42,7 +44,11 @@ class SecretsProxyAddon:
         return self.config.is_host_allowed(host)
 
     def _substitute_in_text(
-        self, text: str, host: str, url_encode: bool = False
+        self,
+        text: str,
+        host: str,
+        url_encode: bool = False,
+        json_escape: bool = False,
     ) -> tuple[str, int]:
         """Replace all placeholder occurrences with real secrets for the given host.
 
@@ -59,6 +65,10 @@ class SecretsProxyAddon:
         for placeholder, entry in matches:
             if entry.matches_host(host):
                 value = entry.value
+                if json_escape:
+                    # json.dumps returns a quoted JSON string; strip quotes to get
+                    # the JSON-escaped content for safe injection into existing JSON.
+                    value = json.dumps(value)[1:-1]
                 if url_encode:
                     value = url_quote(value, safe="")
                 text = text.replace(placeholder, value)
@@ -100,24 +110,43 @@ class SecretsProxyAddon:
 
         return urlunsplit((scheme, netloc, path, query, fragment)), total_subs
 
+    @staticmethod
+    def _is_json_content_type(content_type: str | None) -> bool:
+        if not content_type:
+            return False
+        mime = content_type.split(";", 1)[0].strip().lower()
+        return mime == "application/json"
+
     def _try_decompress(self, data: bytes, encoding: str) -> bytes | None:
         """Try to decompress data according to Content-Encoding.
 
         Returns decompressed bytes, or None if decompression fails.
         """
         try:
+            result = None
             if encoding == "gzip":
-                return gzip.decompress(data)
+                result = gzip.decompress(data)
             elif encoding == "deflate":
-                return zlib.decompress(data)
+                result = zlib.decompress(data)
             elif encoding == "br":
                 if _HAS_BROTLI:
-                    return _brotli.decompress(data)
+                    result = _brotli.decompress(data)
+                else:
+                    logger.warning(
+                        "Brotli Content-Encoding detected but 'brotli' package not installed. "
+                        "Skipping body substitution."
+                    )
+                    return None
+            if result is not None and len(result) > MAX_DECOMPRESS_SIZE:
                 logger.warning(
-                    "Brotli Content-Encoding detected but 'brotli' package not installed. "
-                    "Skipping body substitution."
+                    "audit action=skip_body reason=decompress_oversize encoding=%s "
+                    "decompressed_size=%d max_size=%d",
+                    encoding,
+                    len(result),
+                    MAX_DECOMPRESS_SIZE,
                 )
                 return None
+            return result
         except Exception as exc:
             logger.warning("Failed to decompress %s body: %s", encoding, exc)
             return None
@@ -233,7 +262,14 @@ class SecretsProxyAddon:
             if body_bytes is not None:
                 try:
                     body_text = body_bytes.decode("utf-8")
-                    new_body, subs = self._substitute_in_text(body_text, host)
+                    is_json_body = self._is_json_content_type(
+                        flow.request.headers.get("Content-Type", "")
+                    )
+                    new_body, subs = self._substitute_in_text(
+                        body_text,
+                        host,
+                        json_escape=is_json_body,
+                    )
                     if subs > 0:
                         new_body_bytes = new_body.encode("utf-8")
                         if was_compressed:
@@ -279,7 +315,9 @@ class SecretsProxyAddon:
                 host, flow.request.path, flow.request.method,
             )
 
-    def _redact_secrets_in_text(self, text: str) -> tuple[str, int]:
+    def _redact_secrets_in_text(
+        self, text: str, json_escape: bool = False
+    ) -> tuple[str, int]:
         """Replace real secret values with redaction markers in response text.
 
         This prevents reflection attacks where an approved host echoes
@@ -289,13 +327,20 @@ class SecretsProxyAddon:
         """
         count = 0
         for _name, entry in self.config.secrets.items():
-            if entry.value in text:
-                text = text.replace(entry.value, f"[REDACTED:{entry.name}]")
-                count += 1
-                logger.warning(
-                    "audit action=redact_response secret=%s reason=reflection_prevention",
-                    entry.name,
-                )
+            search_values = [entry.value]
+            if json_escape:
+                escaped_value = json.dumps(entry.value)[1:-1]
+                if escaped_value != entry.value:
+                    search_values.insert(0, escaped_value)
+
+            for search_value in search_values:
+                if search_value in text:
+                    text = text.replace(search_value, f"[REDACTED:{entry.name}]")
+                    count += 1
+                    logger.warning(
+                        "audit action=redact_response secret=%s reason=reflection_prevention",
+                        entry.name,
+                    )
         return text, count
 
     def response(self, flow: http.HTTPFlow) -> None:
@@ -349,7 +394,12 @@ class SecretsProxyAddon:
             if body_bytes is not None:
                 try:
                     body_text = body_bytes.decode("utf-8")
-                    new_body, redactions = self._redact_secrets_in_text(body_text)
+                    is_json_body = self._is_json_content_type(
+                        flow.response.headers.get("Content-Type", "")
+                    )
+                    new_body, redactions = self._redact_secrets_in_text(
+                        body_text, json_escape=is_json_body
+                    )
                     if redactions > 0:
                         new_body_bytes = new_body.encode("utf-8")
                         if was_compressed:
@@ -384,6 +434,17 @@ class SecretsProxyAddon:
                 "audit action=redact_response host=%s path=%s redactions=%d",
                 flow.request.pretty_host, flow.request.path, total_redactions,
             )
+
+    def websocket_message(self, flow: http.HTTPFlow) -> None:
+        flow.kill()
+        logger.warning(
+            "WebSocket blocked (not supported by secrets-proxy)",
+            extra={
+                "audit_action": "block_websocket",
+                "host": getattr(flow.request, "pretty_host", ""),
+                "path": getattr(flow.request, "path", ""),
+            },
+        )
 
     @property
     def stats(self) -> dict[str, int]:
