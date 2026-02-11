@@ -140,9 +140,14 @@ class SecretsProxyAddon:
         # (prevents fail-open where compressed body passes through unscanned)
         if not _HAS_BROTLI and "Accept-Encoding" in flow.request.headers:
             ae = flow.request.headers["Accept-Encoding"]
-            cleaned = ae.replace(", br", "").replace("br, ", "").replace("br", "")
+            tokens = [t.strip() for t in ae.split(",")]
+            filtered = [t for t in tokens if t and not t.startswith("br")]
+            cleaned = ", ".join(filtered)
             if cleaned != ae:
-                flow.request.headers["Accept-Encoding"] = cleaned
+                if cleaned:
+                    flow.request.headers["Accept-Encoding"] = cleaned
+                else:
+                    del flow.request.headers["Accept-Encoding"]
 
         # 2. Substitute placeholders in request headers
         total_subs = 0
@@ -170,17 +175,37 @@ class SecretsProxyAddon:
             body_bytes = flow.request.content
             was_compressed = False
 
-            if content_encoding in ("gzip", "deflate", "br"):
-                decompressed = self._try_decompress(body_bytes, content_encoding)
+            # Parse Content-Encoding as a token list (handles compound like "gzip, br")
+            _SUPPORTED_ENCODINGS = {"gzip", "deflate", "br", "identity", ""}
+            encoding_tokens = [t.strip() for t in content_encoding.split(",")]
+
+            if content_encoding and not all(t in _SUPPORTED_ENCODINGS for t in encoding_tokens):
+                # Unknown or unsupported encoding — fail closed (cannot scan body)
+                logger.warning(
+                    "audit action=block host=%s path=%s reason=unsupported_content_encoding encoding=%s",
+                    host, flow.request.path, content_encoding,
+                )
+                flow.response = http.Response.make(
+                    415,
+                    f"secrets-proxy: unsupported Content-Encoding '{content_encoding}'".encode(),
+                    {"Content-Type": "text/plain"},
+                )
+                return
+
+            # Apply decompression in reverse order (outermost encoding listed last)
+            active_encodings = [t for t in encoding_tokens if t and t != "identity"]
+            for enc in reversed(active_encodings):
+                decompressed = self._try_decompress(body_bytes, enc)
                 if decompressed is not None:
                     body_bytes = decompressed
                     was_compressed = True
                 else:
                     logger.warning(
                         "audit action=skip_body host=%s path=%s reason=decompress_failed encoding=%s",
-                        host, flow.request.path, content_encoding,
+                        host, flow.request.path, enc,
                     )
                     body_bytes = None
+                    break
 
             if body_bytes is not None:
                 try:
@@ -189,10 +214,17 @@ class SecretsProxyAddon:
                     if subs > 0:
                         new_body_bytes = new_body.encode("utf-8")
                         if was_compressed:
-                            recompressed = self._try_compress(
-                                new_body_bytes, content_encoding
-                            )
-                            if recompressed is not None:
+                            # Re-compress in forward order (reverse of decompression)
+                            recompressed = new_body_bytes
+                            compress_ok = True
+                            for enc in active_encodings:
+                                result = self._try_compress(recompressed, enc)
+                                if result is not None:
+                                    recompressed = result
+                                else:
+                                    compress_ok = False
+                                    break
+                            if compress_ok:
                                 flow.request.content = recompressed
                             else:
                                 flow.request.content = new_body_bytes
