@@ -45,10 +45,22 @@ PROXY_PORT = 8080
 # upstream hosts without being redirected back to itself.
 _PROXY_MARK = 0x1
 
-# Name of the dedicated nftables chain managed by secrets-proxy.  Using a
-# dedicated chain avoids collisions with other rules in "ip nat OUTPUT" and
-# makes teardown safe (we only flush our own chain).
-_NFT_CHAIN = "secrets_proxy"
+# Shared nftables table for secrets-proxy chains.
+_NFT_TABLE = "secrets_proxy"
+_NFT_NAT_CHAIN_PREFIX = "secrets_proxy"
+_NFT_FILTER_CHAIN_PREFIX = "secrets_proxy_filter"
+
+# Names of chains created by this process instance.
+_NFT_NAT_CHAIN_NAME: str | None = None
+_NFT_FILTER_CHAIN_NAME: str | None = None
+
+
+def _nft_chain_names_for_pid(pid: int) -> tuple[str, str]:
+    """Return per-process nftables chain names."""
+    return (
+        f"{_NFT_NAT_CHAIN_PREFIX}_{pid}",
+        f"{_NFT_FILTER_CHAIN_PREFIX}_{pid}",
+    )
 
 
 def _check_mitmdump() -> None:
@@ -130,50 +142,66 @@ def _setup_nftables(sandbox_uid: int, proxy_port: int) -> bool:
         return False
 
     try:
-        cmds = [
-            # --- Create inet tables (covers both IPv4 and IPv6) ---
-            ["nft", "add", "table", "inet", _NFT_CHAIN],
+        global _NFT_NAT_CHAIN_NAME, _NFT_FILTER_CHAIN_NAME
+        pid = os.getpid()
+        nat_chain, filter_chain = _nft_chain_names_for_pid(pid)
+        _NFT_NAT_CHAIN_NAME = nat_chain
+        _NFT_FILTER_CHAIN_NAME = filter_chain
 
+        # Create shared table once; multiple secrets-proxy instances can add
+        # distinct chains in the same table safely.
+        table_exists = subprocess.run(
+            ["nft", "list", "table", "inet", _NFT_TABLE],
+            capture_output=True,
+        )
+        if table_exists.returncode != 0:
+            subprocess.run(
+                ["nft", "add", "table", "inet", _NFT_TABLE],
+                check=True,
+                capture_output=True,
+            )
+
+        cmds = [
             # --- NAT chain (IPv4 redirect) ---
             # Note: redirect target in inet NAT chains applies to IPv4 traffic.
             # IPv6 TCP is handled by the filter chain (dropped).
-            ["nft", "add", "chain", "inet", _NFT_CHAIN, "nat_output",
+            ["nft", "add", "chain", "inet", _NFT_TABLE, nat_chain,
              "{ type nat hook output priority -1 ; }"],
 
             # 1. Skip marked packets (proxy's own upstream traffic)
-            ["nft", "add", "rule", "inet", _NFT_CHAIN, "nat_output",
+            ["nft", "add", "rule", "inet", _NFT_TABLE, nat_chain,
              "meta", "mark", hex(_PROXY_MARK), "accept"],
 
             # 2. Allow sandbox -> proxy listener ONLY (not all of localhost)
-            ["nft", "add", "rule", "inet", _NFT_CHAIN, "nat_output",
+            ["nft", "add", "rule", "inet", _NFT_TABLE, nat_chain,
              "meta", "skuid", str(sandbox_uid),
              "ip", "daddr", "127.0.0.1", "tcp", "dport", str(proxy_port), "accept"],
 
             # 3. Redirect all remaining IPv4 TCP from sandbox UID to proxy port
-            ["nft", "add", "rule", "inet", _NFT_CHAIN, "nat_output",
+            ["nft", "add", "rule", "inet", _NFT_TABLE, nat_chain,
              "meta", "skuid", str(sandbox_uid),
              "meta", "nfproto", "ipv4",
              "meta", "l4proto", "tcp",
              "redirect", "to", f":{proxy_port}"],
 
             # --- Filter chain (blocks IPv6 TCP + all UDP except DNS) ---
-            ["nft", "add", "chain", "inet", _NFT_CHAIN, "filter_output",
+            ["nft", "add", "chain", "inet", _NFT_TABLE, filter_chain,
              "{ type filter hook output priority 0 ; }"],
 
             # 4. Drop ALL IPv6 TCP from sandbox (proxy only listens on IPv4)
-            ["nft", "add", "rule", "inet", _NFT_CHAIN, "filter_output",
+            ["nft", "add", "rule", "inet", _NFT_TABLE, filter_chain,
              "meta", "skuid", str(sandbox_uid),
              "meta", "nfproto", "ipv6",
              "meta", "l4proto", "tcp",
              "drop"],
 
             # 5a. Allow DNS (UDP port 53) so name resolution works
-            ["nft", "add", "rule", "inet", _NFT_CHAIN, "filter_output",
+            ["nft", "add", "rule", "inet", _NFT_TABLE, filter_chain,
              "meta", "skuid", str(sandbox_uid),
              "udp", "dport", "53", "accept"],
 
             # 5b. Drop all other UDP from sandbox UID (QUIC bypass prevention)
-            ["nft", "add", "rule", "inet", _NFT_CHAIN, "filter_output",
+            ["nft", "add", "rule", "inet", _NFT_TABLE, filter_chain,
              "meta", "skuid", str(sandbox_uid),
              "meta", "l4proto", "udp",
              "drop"],
@@ -194,19 +222,86 @@ def _setup_nftables(sandbox_uid: int, proxy_port: int) -> bool:
 def _teardown_nftables(sandbox_uid: int, proxy_port: int) -> None:
     """Remove only the nftables table created by secrets-proxy. Best-effort.
 
-    Deletes the dedicated ``inet secrets_proxy`` table (which contains both
-    the NAT and filter chains) without touching any other rules.
+    Flushes and deletes the per-process chains without touching chains created
+    by other processes.
     """
     if platform.system() != "Linux":
         return
+    del sandbox_uid, proxy_port  # kept for backward-compatible call shape
+
+    nat_chain = _NFT_NAT_CHAIN_NAME
+    filter_chain = _NFT_FILTER_CHAIN_NAME
+    if nat_chain is None or filter_chain is None:
+        nat_chain, filter_chain = _nft_chain_names_for_pid(os.getpid())
+
+    for chain in (nat_chain, filter_chain):
+        try:
+            subprocess.run(
+                ["nft", "flush", "chain", "inet", _NFT_TABLE, chain],
+                capture_output=True,
+            )
+            subprocess.run(
+                ["nft", "delete", "chain", "inet", _NFT_TABLE, chain],
+                capture_output=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    logger.info("nftables rules cleaned up (chains: %s, %s)", nat_chain, filter_chain)
+
+
+def cleanup_nftables_chains() -> list[str]:
+    """Remove stale secrets-proxy nftables chains across tables/families."""
+    if platform.system() != "Linux":
+        return []
+
     try:
-        subprocess.run(
-            ["nft", "delete", "table", "inet", _NFT_CHAIN],
+        result = subprocess.run(
+            ["nft", "-j", "list", "ruleset"],
+            check=True,
             capture_output=True,
+            text=True,
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-    logger.info("nftables rules cleaned up")
+        return []
+
+    try:
+        ruleset = _json.loads(result.stdout or "{}")
+    except _json.JSONDecodeError:
+        return []
+
+    matches: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in ruleset.get("nftables", []):
+        chain = entry.get("chain")
+        if not isinstance(chain, dict):
+            continue
+
+        name = chain.get("name")
+        family = chain.get("family")
+        table = chain.get("table")
+        if not isinstance(name, str) or not isinstance(family, str) or not isinstance(table, str):
+            continue
+        if not name.startswith("secrets_proxy_"):
+            continue
+
+        key = (family, table, name)
+        if key not in seen:
+            seen.add(key)
+            matches.append(key)
+
+    cleaned: list[str] = []
+    for family, table, name in matches:
+        subprocess.run(
+            ["nft", "flush", "chain", family, table, name],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["nft", "delete", "chain", family, table, name],
+            capture_output=True,
+        )
+        cleaned.append(f"{family} {table} {name}")
+
+    return cleaned
 
 
 def start_proxy(
@@ -289,6 +384,8 @@ def run(
 
     Returns the sandboxed command's exit code.
     """
+    print("If this process is killed with SIGKILL, run: secrets-proxy cleanup")
+
     port = config.proxy_port or PROXY_PORT
 
     # Step 1: Check dependencies
