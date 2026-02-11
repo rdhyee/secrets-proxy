@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -151,6 +152,31 @@ class TestResponseScrubbing:
         assert "SECRETS_PROXY_PLACEHOLDER_abc123" in result
         # No redaction markers since no real secret value present
         assert "[REDACTED:" not in result
+
+    def test_brotli_decode_unavailable_logs_and_passes_through(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """When brotli decoding is unavailable, response is left unchanged."""
+        monkeypatch.setattr("secrets_proxy.addon._HAS_BROTLI", False)
+        monkeypatch.setattr("secrets_proxy.addon._brotli", None)
+
+        config = _make_config()
+        addon = SecretsProxyAddon(config)
+        original = "Bearer sk-real-key-12345"
+        headers = {
+            "Content-Encoding": "br",
+            "Content-Length": str(len(original.encode("utf-8"))),
+        }
+        flow = _make_flow(response_body=original, response_headers=headers)
+
+        with caplog.at_level(logging.WARNING):
+            addon.response(flow)
+
+        assert flow.response.content == original.encode("utf-8")
+        assert any(
+            "audit action=skip_response_scrub" in rec.message and "encoding=br" in rec.message
+            for rec in caplog.records
+        )
 
 
 class TestRedactSecretsInText:

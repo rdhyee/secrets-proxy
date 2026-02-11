@@ -214,6 +214,7 @@ def start_proxy(
     addon_path: str,
     *,
     use_transparent: bool = False,
+    addon_env: dict[str, str] | None = None,
 ) -> subprocess.Popen:
     """Start mitmproxy with the secrets addon.
 
@@ -247,8 +248,13 @@ def start_proxy(
         cmd.extend(["--set", f"mark={_PROXY_MARK}"])
 
     logger.info("Starting mitmproxy (%s mode): %s", mode, " ".join(cmd))
+    proxy_env = os.environ.copy()
+    if addon_env:
+        proxy_env.update(addon_env)
+
     proc = subprocess.Popen(
         cmd,
+        env=proxy_env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -296,7 +302,7 @@ def run(
     logger.info("CA bundle created at %s", bundle_path)
 
     # Step 4: Write addon script (secrets passed via env var, not in file)
-    addon_script = _create_addon_script(config)
+    addon_script, addon_env = _create_addon_script(config)
 
     # Step 5: Try nftables (Linux strong mode) BEFORE starting proxy
     # so we know which mitmproxy mode to use.
@@ -305,17 +311,23 @@ def run(
 
     # Step 6: Start mitmproxy — transparent mode when nftables is active
     proxy_proc = start_proxy(
-        config, addon_script, use_transparent=used_nftables,
+        config, addon_script, use_transparent=used_nftables, addon_env=addon_env,
     )
 
     # Sandbox process reference for health monitor
     sandbox_proc: subprocess.Popen | None = None
+    sandbox_ready = threading.Event()
+    shutting_down = threading.Event()
 
     def _proxy_health_monitor() -> None:
         """Background thread: kill sandbox if proxy dies unexpectedly."""
-        while True:
-            time.sleep(1)
+        sandbox_ready.wait()
+        while not shutting_down.is_set():
+            if shutting_down.wait(timeout=1):
+                return
             if proxy_proc.poll() is not None:
+                if shutting_down.is_set():
+                    return
                 logger.error(
                     "mitmproxy died (exit %d) — killing sandbox for fail-closed safety",
                     proxy_proc.returncode,
@@ -326,6 +338,9 @@ def run(
 
     def _cleanup() -> None:
         """Best-effort cleanup of all resources."""
+        # Prevent monitor from killing sandbox during intentional shutdown.
+        shutting_down.set()
+        sandbox_ready.set()
         proxy_proc.terminate()
         try:
             proxy_proc.wait(timeout=5)
@@ -342,8 +357,6 @@ def run(
                 os.unlink(path)
             except OSError:
                 pass
-
-        os.environ.pop("SECRETS_PROXY_CONFIG_JSON", None)
 
     def _signal_handler(signum: int, frame: object) -> None:
         logger.info("Received signal %d, cleaning up...", signum)
@@ -363,9 +376,6 @@ def run(
         # CA trust env vars
         sandbox_env.update(ca_env)
 
-        # Remove the config JSON from child env (addon already read it)
-        sandbox_env.pop("SECRETS_PROXY_CONFIG_JSON", None)
-
         # Proxy env vars (harmless when nftables is active,
         # primary enforcement mechanism on macOS)
         proxy_url = f"http://{PROXY_HOST}:{port}"
@@ -382,6 +392,7 @@ def run(
         logger.info("Running: %s", " ".join(command))
         try:
             sandbox_proc = subprocess.Popen(command, env=sandbox_env)
+            sandbox_ready.set()
             sandbox_proc.wait()
             return sandbox_proc.returncode
         finally:
@@ -396,7 +407,7 @@ def run(
         _cleanup()
 
 
-def _create_addon_script(config: ProxyConfig) -> str:
+def _create_addon_script(config: ProxyConfig) -> tuple[str, dict[str, str]]:
     """Create a temporary mitmproxy addon script.
 
     Secrets are passed via the SECRETS_PROXY_CONFIG_JSON environment variable
@@ -412,10 +423,10 @@ def _create_addon_script(config: ProxyConfig) -> str:
             "value": entry.value,
             "hosts": entry.hosts,
         }
-    os.environ["SECRETS_PROXY_CONFIG_JSON"] = _json.dumps({
+    addon_env = {"SECRETS_PROXY_CONFIG_JSON": _json.dumps({
         "secrets": secrets_data,
         "allowed_hosts": allowed_hosts,
-    })
+    })}
 
     script_content = '''"""Auto-generated mitmproxy addon for secrets-proxy.
 
@@ -567,4 +578,4 @@ def response(flow: http.HTTPFlow) -> None:
     with os.fdopen(fd, "w") as f:
         f.write(script_content)
 
-    return path
+    return path, addon_env

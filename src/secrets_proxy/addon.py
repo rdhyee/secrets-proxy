@@ -7,7 +7,7 @@ import io
 import logging
 import zlib
 from typing import TYPE_CHECKING
-from urllib.parse import quote as url_quote
+from urllib.parse import quote as url_quote, urlsplit, urlunsplit
 
 from mitmproxy import http
 
@@ -75,6 +75,30 @@ class SecretsProxyAddon:
                     entry.hosts,
                 )
         return text, count
+
+    def _substitute_in_url(self, url: str, host: str) -> tuple[str, int]:
+        """Substitute placeholders in a URL with query-only URL encoding.
+
+        - Query component: URL-encode injected secret values.
+        - Non-query components (scheme/netloc/path/fragment): plain substitution.
+        """
+        split = urlsplit(url)
+        total_subs = 0
+
+        scheme, subs = self._substitute_in_text(split.scheme, host, url_encode=False)
+        total_subs += subs
+        netloc, subs = self._substitute_in_text(split.netloc, host, url_encode=False)
+        total_subs += subs
+        path, subs = self._substitute_in_text(split.path, host, url_encode=False)
+        total_subs += subs
+        query, subs = self._substitute_in_text(split.query, host, url_encode=True)
+        total_subs += subs
+        fragment, subs = self._substitute_in_text(
+            split.fragment, host, url_encode=False
+        )
+        total_subs += subs
+
+        return urlunsplit((scheme, netloc, path, query, fragment)), total_subs
 
     def _try_decompress(self, data: bytes, encoding: str) -> bytes | None:
         """Try to decompress data according to Content-Encoding.
@@ -158,11 +182,10 @@ class SecretsProxyAddon:
                 flow.request.headers[header_name] = new_value
                 total_subs += subs
 
-        # 3. Substitute placeholders in URL (query params) — URL-encode secrets
+        # 3. Substitute placeholders in URL.
+        # URL-encode substitutions in query only; keep path/host unencoded.
         if flow.request.url:
-            new_url, subs = self._substitute_in_text(
-                flow.request.url, host, url_encode=True
-            )
+            new_url, subs = self._substitute_in_url(flow.request.url, host)
             if subs > 0:
                 flow.request.url = new_url
                 total_subs += subs
@@ -313,6 +336,13 @@ class SecretsProxyAddon:
                     body_bytes = decompressed
                     was_compressed = True
                 else:
+                    logger.warning(
+                        "audit action=skip_response_scrub host=%s path=%s "
+                        "reason=decompress_failed encoding=%s",
+                        flow.request.pretty_host,
+                        flow.request.path,
+                        enc,
+                    )
                     body_bytes = None
                     break
 
