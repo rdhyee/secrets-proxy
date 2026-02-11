@@ -179,76 +179,78 @@ Steps:
 
 This is "practical security for AI agent sandboxing" — not a high-assurance enclave. The goal is to prevent accidental or injection-driven secret exfiltration, not to resist a sophisticated attacker with root.
 
-## Deployment Patterns
+## Deployment Patterns (Validated)
 
-### Pattern 1: Inside a Sprite
+All three patterns have been tested end-to-end with real OpenAI API calls.
 
-```bash
-# On sprite setup (golden image):
-pip install secrets-proxy
-# Checkpoint here
+### Pattern 1: Inside a Sprite (Firecracker microVM)
 
-# At task time:
-sprite exec -- secrets-proxy run \
-  --config /tmp/secrets.json \
-  --allow-net api.openai.com \
-  -- python /tmp/task.py
-```
+**Status: Validated (7/7 escape tests pass)**
 
-The secret config is passed in at task time (not baked into the image). The proxy starts, wraps the task, and tears down.
-
-### Pattern 2: Docker sidecar
-
-```yaml
-# docker-compose.yml
-services:
-  proxy:
-    image: secrets-proxy
-    environment:
-      - SECRETS_CONFIG=...
-    networks:
-      - isolated
-
-  worker:
-    image: python:3.13
-    network_mode: "service:proxy"  # shares network namespace
-    depends_on: [proxy]
-    environment:
-      - OPENAI_API_KEY=SECRETS_PROXY_PLACEHOLDER_xxx
-      - HTTP_PROXY=http://proxy:8080
-      - HTTPS_PROXY=http://proxy:8080
-```
-
-### Pattern 3: Local development
+Sprites use `--mode regular` (not transparent) because Fly's Firecracker kernel (6.12.27-fly) supports nftables and SO_MARK but **not SO_ORIGINAL_DST** needed for transparent mode. Security is equivalent: proxy env vars provide primary routing, nftables catches bypass attempts.
 
 ```bash
-# macOS — weak mode (proxy env vars, no nftables)
+# Prerequisites (one-time on sprite):
+pip install mitmproxy
+sudo apt-get install -y nftables
+
+# At task time — pass secrets via env var, never write to disk:
+CONFIG_JSON='{"OPENAI_API_KEY":{"value":"sk-...","hosts":["api.openai.com"]}}'
+sudo bash sprites/secrets-proxy-run.sh "$CONFIG_JSON" -- python task.py
+```
+
+The launcher runs as root (for nftables + SO_MARK), drops to `sprite` user for the sandboxed command. The sandbox user cannot modify nftables, kill the proxy, or read proxy memory.
+
+**Two-layer enforcement:**
+1. `HTTPS_PROXY` env vars — code that respects them goes through proxy
+2. nftables redirect — code that ignores env vars still gets TCP redirected to proxy port
+
+### Pattern 2: Docker container
+
+**Status: Validated (10/10 escape tests pass)**
+
+Docker uses `--mode transparent` with full nftables enforcement. Requires `--cap-add NET_ADMIN`.
+
+```bash
+docker run --rm --cap-add NET_ADMIN \
+  -e 'SECRETS_PROXY_CONFIG_JSON={"OPENAI_API_KEY":{"value":"sk-...","hosts":["api.openai.com"]}}' \
+  secrets-proxy-test \
+  "python task.py"
+```
+
+The entrypoint (init time) starts mitmproxy, installs nftables rules, sets up CA trust, then drops to unprivileged `sandbox` user (run time). See `Dockerfile` and `docker/entrypoint.sh`.
+
+**Key learnings from Docker validation:**
+- Must create nftables tables explicitly (`nft add table ip nat`)
+- CA bundle needs `chmod 644` (mkstemp creates 0600, sandbox user needs read access)
+- Must append mitmproxy CA to certifi's bundle (Python ignores system CA store)
+
+### Pattern 3: Local development (macOS)
+
+**Status: Validated (3/3 tests pass)**
+
+macOS uses `--mode regular` with proxy env vars only (no nftables). Weaker enforcement — sandboxed code could bypass by ignoring env vars. Acceptable for development and testing.
+
+```bash
 secrets-proxy run --config secrets.json -- python my_script.py
+# Or standalone:
+./scripts/secrets-proxy-run.sh --config secrets.json -- python my_script.py
 ```
 
-## MVP Scope
+### Comparison with Deno Sandbox
 
-The MVP focuses on the simplest useful implementation:
+secrets-proxy on Sprites/Docker replaces Deno Sandbox for AI agent sandboxing:
 
-1. **mitmproxy addon** that does placeholder → secret substitution
-2. **Shell launcher script** (`secrets-proxy-run.sh`) that:
-   - Starts mitmproxy in transparent mode
-   - Sets up CA trust env vars
-   - Sets placeholder env vars
-   - Runs the sandboxed command
-   - Cleans up on exit
-3. **JSON config format** for secrets
-4. **Linux support only** for nftables enforcement (macOS falls back to env vars)
-5. **Test inside a Sprite** to validate end-to-end
+| | Deno Sandbox | secrets-proxy (Sprites/Docker) |
+|---|---|---|
+| Secret proxy | Built-in | Our own (more control) |
+| CA trust / transparency | Broken for Python urllib/ssl | Works with ANY language/HTTP library |
+| Runtime | Deno only (or fight with certs) | Full Linux — Python, Node, Go, anything |
+| Duration | <30min ephemeral | Persistent, checkpointable (Sprites) |
+| Isolation | Process-level | VM-level (Sprites) or container-level (Docker) |
+| Enforcement | Proxy-level | Kernel-level (nftables) |
 
-### Not in MVP
-- PyPI packaging
-- Docker sidecar mode
-- DNS filtering
-- Web UI / monitoring
-- Encrypted secret config (secrets.json is plaintext — protect it with file permissions)
-- Windows support
-- Wildcard host patterns
+The key advantage: secrets-proxy's CA trust setup means `urllib`, `requests`, `httpx`, `curl`, Node `fetch`, Go `net/http` — all work transparently without code changes.
 
 ## File Structure
 
