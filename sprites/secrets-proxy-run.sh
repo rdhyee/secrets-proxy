@@ -9,7 +9,7 @@ set -euo pipefail
 
 PROXY_PORT=8080
 PROXY_MARK=1
-SANDBOX_USER="sprite"
+SANDBOX_USER="sandbox"
 SANDBOX_UID=$(id -u "$SANDBOX_USER")
 NFT_CHAIN="secrets_proxy"
 MITMDUMP="/.sprite/languages/python/pyenv/versions/3.13.7/bin/mitmdump"

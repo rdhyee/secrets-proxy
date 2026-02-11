@@ -79,7 +79,38 @@ def test_nftables():
     if r.returncode == 0:
         print("  FAIL: flushed nftables!")
         return False
-    print(f"  PASS: Denied ({r.stderr.strip()[:60]})")
+    print(f"  PASS: Denied without sudo ({r.stderr.strip()[:60]})")
+    return True
+
+
+def test_sudo_nftables():
+    """The real test: can we use sudo to flush nftables?"""
+    r = subprocess.run(["sudo", "nft", "flush", "ruleset"],
+                       capture_output=True, text=True, timeout=5,
+                       input="")  # empty stdin for password prompt
+    if r.returncode == 0:
+        print("  FAIL: sudo nft flush worked! Jail escaped!")
+        return False
+    print(f"  PASS: sudo denied ({r.stderr.strip()[:80]})")
+    return True
+
+
+def test_sudo_cat_environ():
+    """Try to read proxy process env via sudo."""
+    r = subprocess.run(["pgrep", "-f", "mitmdump"], capture_output=True, text=True, timeout=5)
+    if r.returncode != 0:
+        print("  (no mitmdump found)")
+        return True
+    pid = r.stdout.strip().split("\n")[0]
+    r2 = subprocess.run(["sudo", "cat", f"/proc/{pid}/environ"],
+                        capture_output=True, text=True, timeout=5, input="")
+    if r2.returncode == 0:
+        if "sk-" in r2.stdout:
+            print(f"  FAIL: sudo read real secret from PID {pid} environ!")
+        else:
+            print(f"  FAIL: sudo read proxy environ (no secrets found)")
+        return False
+    print(f"  PASS: sudo denied ({r2.stderr.strip()[:80]})")
     return True
 
 
@@ -115,6 +146,8 @@ tests = [
     ("Non-allowed host blocked", test_blocked_host),
     ("Direct IP intercepted", test_direct_ip),
     ("Cannot modify nftables", test_nftables),
+    ("Cannot sudo nft flush", test_sudo_nftables),
+    ("Cannot sudo read proxy env", test_sudo_cat_environ),
     ("Cannot kill proxy", test_kill_proxy),
     ("Cannot create raw socket", test_raw_socket),
 ]
