@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "secrets-proxy"
+version = "0.1.0"
+description = "A transparent MITM proxy that injects secrets into sandboxed code's outbound HTTPS requests"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Raymond Yee" },
+]
+dependencies = [
+    "mitmproxy>=11.0",
+]
+
+[project.scripts]
+secrets-proxy = "secrets_proxy.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/secrets_proxy"]
