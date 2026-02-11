@@ -2,7 +2,7 @@
 
 ## Design Goals
 
-1. **Transparency**: Sandboxed code should not need modification to work with the proxy. Docker uses true transparent mode (nftables redirect + `--mode transparent`). Sprites use regular proxy mode (`HTTPS_PROXY` env vars + `--mode regular`) with nftables as a fail-closed kill switch that blocks bypass attempts.
+1. **Transparency**: Proxy-aware sandboxed code should not need modification. Docker uses true transparent mode (nftables redirect + `--mode transparent`) where even non-proxy-aware clients work seamlessly. Sprites use regular proxy mode (`HTTPS_PROXY` env vars + `--mode regular`) where proxy-aware clients work normally and non-proxy-aware clients fail closed (nftables kill switch).
 2. **Secret isolation**: Real credentials never appear in the sandbox's environment, memory, or filesystem.
 3. **Host-scoped injection**: Each secret is bound to specific destination hosts. Sending a placeholder to an unapproved host leaks only the useless placeholder string.
 4. **Network policy**: Non-allowlisted hosts are blocked entirely (defense in depth).
@@ -108,7 +108,7 @@ nft add rule ip filter secrets_proxy_filter meta skuid $SANDBOX_UID ip protocol 
 - **All TCP, not just 443/80**: Redirecting only ports 443 and 80 would miss API calls on non-standard ports. All TCP is redirected.
 - **UDP blocked except DNS**: HTTP/3 (QUIC) runs over UDP and would bypass the MITM proxy. All UDP except port 53 (DNS) is blocked, forcing clients to fall back to TCP-based HTTP/2 or HTTP/1.1. DNS queries are allowed so name resolution works; DNS-based exfiltration remains a known limitation (future: DNS filtering).
 - **Dedicated chain**: Using a dedicated `secrets_proxy` chain (rather than adding rules to the system `OUTPUT` chain) means teardown only flushes our rules without disrupting other nftables configuration.
-- **Transparent mode**: nftables redirect sends raw TCP (not HTTP CONNECT) to the proxy port, so mitmproxy must run in `--mode transparent` (not `--mode regular`).
+- **Transparent mode (Docker only)**: nftables redirect sends raw TCP (not HTTP CONNECT) to the proxy port, so mitmproxy must run in `--mode transparent` (not `--mode regular`). On Sprites, where `SO_ORIGINAL_DST` is unavailable, mitmproxy runs in `--mode regular` and nftables serves as a fail-closed kill switch instead (see Pattern 1 below).
 
 This is the "strong jail" -- the sandboxed process literally cannot bypass the proxy at the kernel level. (Inspired by httpjail's Linux enforcement.)
 
@@ -200,7 +200,7 @@ All three patterns have been tested end-to-end with real OpenAI API calls.
 
 **Status: Validated (7/7 escape tests pass)**
 
-Sprites use `--mode regular` (not transparent) because Fly's Firecracker kernel (6.12.27-fly) supports nftables and SO_MARK but **not SO_ORIGINAL_DST** needed for transparent mode. The nftables layer acts as a **fail-closed kill switch**: code that ignores `HTTPS_PROXY` env vars gets its TCP redirected to the proxy port, but since the proxy runs in regular mode (expecting HTTP CONNECT) and the redirected traffic is raw TLS (ClientHello), the protocol mismatch causes the connection to fail — not to be transparently proxied. This is intentional: bypass attempts are blocked, not silently forwarded.
+Sprites use `--mode regular` (not transparent) because Fly's Firecracker kernel (6.12.27-fly) supports nftables and SO_MARK but **not SO_ORIGINAL_DST** needed for transparent mode. The nftables layer acts as a **fail-closed kill switch**: code that ignores `HTTPS_PROXY` env vars gets its TCP redirected to the proxy port, but since the proxy runs in regular mode (expecting HTTP CONNECT) and the redirected traffic is raw TLS (ClientHello), the protocol mismatch causes the connection to fail — not to be transparently proxied. This is intentional: TLS bypass attempts fail closed rather than being silently forwarded.
 
 ```bash
 # Prerequisites (one-time on sprite):
@@ -216,7 +216,7 @@ The launcher runs as root (for nftables + SO_MARK), drops to `sprite` user for t
 
 **Two-layer enforcement:**
 1. `HTTPS_PROXY` env vars — code that respects them goes through proxy normally
-2. nftables kill switch — code that ignores env vars gets TCP redirected to the proxy port, where the protocol mismatch (raw TLS vs expected HTTP CONNECT) causes connection failure, blocking the bypass attempt
+2. nftables kill switch — code that ignores env vars gets TCP redirected to the proxy port, where the protocol mismatch (raw TLS ClientHello vs expected HTTP CONNECT) causes TLS connection failure, blocking the bypass attempt
 
 ### Pattern 2: Docker container
 

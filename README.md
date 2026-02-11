@@ -35,7 +35,7 @@ When running untrusted or semi-trusted code in sandboxes (Sprites, Docker, VMs),
 
 | Property | How |
 |----------|-----|
-| **Code is oblivious** | Transparent proxy (Docker) or regular proxy + nftables kill switch (Sprites) — code doesn't need modification |
+| **Code is oblivious** | Transparent proxy (Docker, all clients) or regular proxy + nftables kill switch (Sprites, proxy-aware clients) |
 | **Most languages work** | Broad CA compatibility via `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS` |
 | **Secrets never in sandbox** | Placeholder tokens only; real values injected at proxy layer |
 | **Host-scoped secrets** | Each secret specifies which hosts it can be sent to |
