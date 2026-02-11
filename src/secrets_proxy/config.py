@@ -144,6 +144,33 @@ class ProxyConfig:
         """Return env vars to set in the sandboxed process (placeholder values)."""
         return {entry.name: entry.placeholder for entry in self.secrets.values()}
 
+    def to_env_json(self) -> str:
+        """Serialize config to JSON for SECRETS_PROXY_CONFIG_JSON env var.
+
+        Format consumed by addon_entry.py:
+        {
+            "secrets": {
+                "PLACEHOLDER_HEX": {
+                    "name": "SECRET_NAME",
+                    "value": "real-value",
+                    "hosts": ["api.example.com"]
+                }
+            },
+            "allowed_hosts": ["api.example.com", ...]
+        }
+        """
+        secrets_data = {}
+        for _name, entry in self.secrets.items():
+            secrets_data[entry.placeholder] = {
+                "name": entry.name,
+                "value": entry.value,
+                "hosts": entry.hosts,
+            }
+        return json.dumps({
+            "secrets": secrets_data,
+            "allowed_hosts": sorted(self.allowed_hosts),
+        })
+
     def find_secret_for_placeholder(
         self, text: str
     ) -> list[tuple[str, SecretEntry]]:
@@ -173,27 +200,16 @@ def generate_placeholder(name: str) -> str:
     return f"SECRETS_PROXY_PLACEHOLDER_{random_hex}"
 
 
-def load_config(
-    config_path: str | Path,
+def _build_config_from_dict(
+    raw: dict,
     allow_net: list[str] | None = None,
     allow_ip_literals: bool = False,
 ) -> ProxyConfig:
-    """Load secret configuration from a JSON file.
+    """Build a ProxyConfig from a raw config dict.
 
-    Config format:
-    {
-        "OPENAI_API_KEY": {
-            "value": "sk-real-key",
-            "hosts": ["api.openai.com"]
-        }
-    }
-
-    Placeholders are auto-generated at load time.
+    Shared implementation for load_config() and load_config_from_dict().
+    All validation (secret names, host patterns) is applied here.
     """
-    path = Path(config_path)
-    with open(path) as f:
-        raw = json.load(f)
-
     config = ProxyConfig(allow_ip_literals=allow_ip_literals)
 
     for name, entry_data in raw.items():
@@ -258,3 +274,49 @@ def load_config(
             config.allowed_hosts.add(host)
 
     return config
+
+
+def load_config(
+    config_path: str | Path,
+    allow_net: list[str] | None = None,
+    allow_ip_literals: bool = False,
+) -> ProxyConfig:
+    """Load secret configuration from a JSON file.
+
+    Config format:
+    {
+        "OPENAI_API_KEY": {
+            "value": "sk-real-key",
+            "hosts": ["api.openai.com"]
+        }
+    }
+
+    Placeholders are auto-generated at load time.
+    """
+    path = Path(config_path)
+    with open(path) as f:
+        raw = json.load(f)
+
+    return _build_config_from_dict(raw, allow_net=allow_net, allow_ip_literals=allow_ip_literals)
+
+
+def load_config_from_dict(
+    raw: dict,
+    allow_net: list[str] | None = None,
+    allow_ip_literals: bool = False,
+) -> ProxyConfig:
+    """Build a ProxyConfig from an already-parsed dict.
+
+    Same validation as load_config() but skips file I/O.
+    Useful for loading config from environment variables or other non-file sources.
+
+    The dict format matches the JSON file format:
+    {
+        "SECRET_NAME": {
+            "value": "real-value",
+            "hosts": ["api.example.com"],
+            "placeholder": "optional-pre-assigned-placeholder"
+        }
+    }
+    """
+    return _build_config_from_dict(raw, allow_net=allow_net, allow_ip_literals=allow_ip_literals)

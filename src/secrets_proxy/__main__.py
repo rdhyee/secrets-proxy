@@ -3,12 +3,41 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
 
-from .config import load_config
+from .config import load_config, load_config_from_dict
 from .launcher import _check_config_permissions, cleanup_nftables_chains, run
+
+
+def _handle_init(args: argparse.Namespace) -> int:
+    """Handle the 'init' subcommand.
+
+    Loads config, generates placeholders, writes sandbox env file,
+    prints the SECRETS_PROXY_CONFIG_JSON value to stdout.
+    """
+    if args.config_json:
+        raw = json.loads(args.config_json)
+    elif args.config_file:
+        with open(args.config_file) as f:
+            raw = json.load(f)
+    else:
+        print("Error: --config-json or --config-file required", file=sys.stderr)
+        return 1
+
+    config = load_config_from_dict(raw)
+
+    # Write sandbox env file (export NAME="PLACEHOLDER")
+    if args.sandbox_env:
+        with open(args.sandbox_env, "w") as f:
+            for entry in config.secrets.values():
+                f.write(f'export {entry.name}="{entry.placeholder}"\n')
+
+    # Print config JSON to stdout for shell capture
+    print(config.to_env_json())
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -53,6 +82,26 @@ def main(argv: list[str] | None = None) -> int:
         help="Command to run (after --)",
     )
 
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Generate placeholders and config JSON for shell scripts",
+    )
+    init_parser.add_argument(
+        "--config-json",
+        default=None,
+        help="Raw JSON config string",
+    )
+    init_parser.add_argument(
+        "--config-file",
+        default=None,
+        help="Path to JSON config file",
+    )
+    init_parser.add_argument(
+        "--sandbox-env",
+        default=None,
+        help="Path to write sandbox env file (export NAME=PLACEHOLDER)",
+    )
+
     subparsers.add_parser(
         "cleanup", help="Clean up stale secrets-proxy nftables chains"
     )
@@ -81,6 +130,9 @@ def main(argv: list[str] | None = None) -> int:
 
         ca_path = Path(args.ca_bundle) if args.ca_bundle else None
         return run(config, cmd, ca_bundle_path=ca_path)
+
+    if args.command == "init":
+        return _handle_init(args)
 
     if args.command == "cleanup":
         cleaned = cleanup_nftables_chains()

@@ -163,7 +163,7 @@ def test_startup_prints_recovery_hint(monkeypatch, tmp_path: Path, capsys) -> No
     monkeypatch.setattr(launcher, "_check_mitmdump", lambda: None)
     monkeypatch.setattr(launcher, "_generate_mitmproxy_ca_if_needed", lambda: None)
     monkeypatch.setattr(launcher, "setup_ca_trust", lambda _: (bundle_path, {}))
-    monkeypatch.setattr(launcher, "_create_addon_script", lambda _: (str(addon_path), {}))
+    monkeypatch.setattr(launcher, "_ADDON_ENTRY_PATH", str(addon_path))
     monkeypatch.setattr(launcher, "_setup_nftables", lambda *_: False)
     monkeypatch.setattr(launcher, "start_proxy", lambda *_, **__: _FakeProc(returncode=None))
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda *_, **__: _FakeProc(returncode=None))

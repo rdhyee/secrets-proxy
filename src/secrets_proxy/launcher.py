@@ -28,13 +28,15 @@ import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
 
 from .ca_trust import setup_ca_trust, MITMPROXY_CA_CERT, MITMPROXY_CA_DIR
 from .config import ProxyConfig
+
+# Reusable path to the addon entry point module (loaded by mitmdump -s).
+_ADDON_ENTRY_PATH = str(Path(__file__).parent / "addon_entry.py")
 
 logger = logging.getLogger("secrets-proxy")
 
@@ -439,8 +441,9 @@ def run(
     bundle_path, ca_env = setup_ca_trust(ca_bundle_path)
     logger.info("CA bundle created at %s", bundle_path)
 
-    # Step 4: Write addon script (secrets passed via env var, not in file)
-    addon_script, addon_env = _create_addon_script(config)
+    # Step 4: Addon entry point (secrets passed via env var, not in file)
+    addon_script = _ADDON_ENTRY_PATH
+    addon_env = {"SECRETS_PROXY_CONFIG_JSON": config.to_env_json()}
 
     # Step 5: Try nftables (Linux strong mode) BEFORE starting proxy
     # so we know which mitmproxy mode to use.
@@ -490,11 +493,10 @@ def run(
         if used_nftables:
             _teardown_nftables(uid, port)
 
-        for path in [addon_script, str(bundle_path)]:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        try:
+            os.unlink(str(bundle_path))
+        except OSError:
+            pass
 
     def _signal_handler(signum: int, frame: object) -> None:
         logger.info("Received signal %d, cleaning up...", signum)
@@ -545,175 +547,6 @@ def run(
         _cleanup()
 
 
-def _create_addon_script(config: ProxyConfig) -> tuple[str, dict[str, str]]:
-    """Create a temporary mitmproxy addon script.
-
-    Secrets are passed via the SECRETS_PROXY_CONFIG_JSON environment variable
-    (not embedded in the script file) so that real credentials are never
-    written to disk.
-    """
-    allowed_hosts = list(config.allowed_hosts)
-
-    secrets_data = {}
-    for name, entry in config.secrets.items():
-        secrets_data[entry.placeholder] = {
-            "name": name,
-            "value": entry.value,
-            "hosts": entry.hosts,
-        }
-    addon_env = {"SECRETS_PROXY_CONFIG_JSON": _json.dumps({
-        "secrets": secrets_data,
-        "allowed_hosts": allowed_hosts,
-    })}
-
-    script_content = '''"""Auto-generated mitmproxy addon for secrets-proxy.
-
-Reads config from SECRETS_PROXY_CONFIG_JSON env var (secrets never touch disk).
-"""
-import json
-import logging
-import os
-
-from mitmproxy import http
-
-logger = logging.getLogger("secrets-proxy-addon")
-
-_config = json.loads(os.environ["SECRETS_PROXY_CONFIG_JSON"])
-SECRETS = _config["secrets"]
-ALLOWED_HOSTS = _config["allowed_hosts"]
-# Clear from env immediately so child processes don't inherit it
-del os.environ["SECRETS_PROXY_CONFIG_JSON"]
-
-
-def _host_allowed(host: str) -> bool:
-    host = host.lower()
-    for pattern in ALLOWED_HOSTS:
-        if pattern.startswith("*."):
-            suffix = pattern[1:]
-            base = pattern[2:]
-            if host == base or (host.endswith(suffix) and len(host) > len(suffix)):
-                return True
-        elif host == pattern:
-            return True
-    return False
-
-
-def _host_matches_secret(host: str, hosts: list) -> bool:
-    host = host.lower()
-    for pattern in hosts:
-        if pattern.startswith("*."):
-            suffix = pattern[1:]
-            base = pattern[2:]
-            if host == base or (host.endswith(suffix) and len(host) > len(suffix)):
-                return True
-        elif host == pattern:
-            return True
-    return False
-
-
-def request(flow: http.HTTPFlow) -> None:
-    host = flow.request.pretty_host
-
-    if not _host_allowed(host):
-        flow.response = http.Response.make(
-            403,
-            f"secrets-proxy: host \\'{host}\\' not in allowlist".encode(),
-            {"Content-Type": "text/plain"},
-        )
-        logger.info("audit action=block host=%s path=%s method=%s", host, flow.request.path, flow.request.method)
-        return
-
-    def substitute(text: str) -> tuple[str, int]:
-        count = 0
-        for placeholder, info in SECRETS.items():
-            if placeholder in text and _host_matches_secret(host, info["hosts"]):
-                text = text.replace(placeholder, info["value"])
-                count += 1
-                logger.info("Injected secret \\'%s\\' for %s", info["name"], host)
-        return text, count
-
-    total_subs = 0
-
-    # Substitute in headers
-    for hname in list(flow.request.headers.keys()):
-        hval = flow.request.headers[hname]
-        new_val, n = substitute(hval)
-        if n > 0:
-            flow.request.headers[hname] = new_val
-            total_subs += n
-
-    # Substitute in URL (query params)
-    if flow.request.url:
-        new_url, n = substitute(flow.request.url)
-        if n > 0:
-            flow.request.url = new_url
-            total_subs += n
-
-    # Substitute in body
-    if flow.request.content:
-        try:
-            body = flow.request.content.decode("utf-8")
-            new_body, n = substitute(body)
-            if n > 0:
-                flow.request.content = new_body.encode("utf-8")
-                # Let mitmproxy recalculate Content-Length
-                if "Content-Length" in flow.request.headers:
-                    flow.request.headers["Content-Length"] = str(len(flow.request.content))
-                total_subs += n
-        except UnicodeDecodeError:
-            logger.warning("audit action=skip_body host=%s path=%s reason=binary_content", host, flow.request.path)
-
-    if total_subs > 0:
-        logger.info("audit action=substitute host=%s path=%s secrets_injected=%d method=%s", host, flow.request.path, total_subs, flow.request.method)
-    else:
-        logger.debug("audit action=pass host=%s path=%s method=%s", host, flow.request.path, flow.request.method)
-
-
-def _redact_secret_values(text: str) -> tuple[str, int]:
-    """Replace real secret values with redaction markers."""
-    count = 0
-    for placeholder, info in SECRETS.items():
-        if info["value"] in text:
-            text = text.replace(info["value"], f"[REDACTED:{info['name']}]")
-            count += 1
-            logger.warning("audit action=redact_response secret=%s reason=reflection_prevention", info["name"])
-    return text, count
-
-
-def response(flow: http.HTTPFlow) -> None:
-    """Scrub real secret values from responses to prevent reflection attacks."""
-    if flow.response is None:
-        return
-
-    total_redactions = 0
-
-    # Scrub response headers
-    for hname in list(flow.response.headers.keys()):
-        hval = flow.response.headers[hname]
-        new_val, n = _redact_secret_values(hval)
-        if n > 0:
-            flow.response.headers[hname] = new_val
-            total_redactions += n
-
-    # Scrub response body
-    if flow.response.content:
-        try:
-            body = flow.response.content.decode("utf-8")
-            new_body, n = _redact_secret_values(body)
-            if n > 0:
-                flow.response.content = new_body.encode("utf-8")
-                if "Content-Length" in flow.response.headers:
-                    flow.response.headers["Content-Length"] = str(len(flow.response.content))
-                total_redactions += n
-        except UnicodeDecodeError:
-            pass
-
-    if total_redactions > 0:
-        logger.warning("audit action=redact_response host=%s path=%s redactions=%d", flow.request.pretty_host, flow.request.path, total_redactions)
-'''
-
-    fd, path = tempfile.mkstemp(suffix=".py", prefix="secrets_proxy_addon_")
-    with os.fdopen(fd, "w") as f:
-        f.write(script_content)
-
-    return path, addon_env
+def _get_addon_entry_path() -> str:
+    """Return the path to the production addon_entry.py module."""
+    return _ADDON_ENTRY_PATH

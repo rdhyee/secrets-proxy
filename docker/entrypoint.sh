@@ -32,122 +32,16 @@ fi
 
 echo "[secrets-proxy] Starting (proxy_port=$PROXY_PORT, sandbox_uid=$SANDBOX_UID)"
 
-# ── Generate addon script from config ─────────────────────────
+# ── Generate config + addon via secrets_proxy init ────────────
 
-ADDON_SCRIPT=$(mktemp /tmp/secrets_proxy_addon_XXXXXX.py)
+SECRETS_PROXY_CONFIG_JSON=$(python3 -m secrets_proxy init \
+    --config-json "$SECRETS_PROXY_CONFIG_JSON" \
+    --sandbox-env /tmp/sandbox_env.sh)
+export SECRETS_PROXY_CONFIG_JSON
 
-python3 -c "
-import json, os, sys
+ADDON_SCRIPT=$(python3 -c "from pathlib import Path; import secrets_proxy.addon_entry; print(Path(secrets_proxy.addon_entry.__file__).resolve())")
 
-config_json = os.environ['SECRETS_PROXY_CONFIG_JSON']
-raw = json.loads(config_json)
-
-secrets_map = {}
-env_lines = []
-allowed_hosts = []
-
-for name, entry in raw.items():
-    import secrets as s
-    placeholder = f'SECRETS_PROXY_PLACEHOLDER_{s.token_hex(16)}'
-    secrets_map[placeholder] = {
-        'name': name,
-        'value': entry['value'],
-        'hosts': entry['hosts'],
-    }
-    env_lines.append(f'{name}={placeholder}')
-    for h in entry['hosts']:
-        allowed_hosts.append(h)
-
-# Write env file for sandbox
-with open('/tmp/sandbox_env.sh', 'w') as f:
-    for line in env_lines:
-        f.write(f'export {line}\n')
-
-# Write addon
-addon = '''
-import logging
-from mitmproxy import http
-
-logger = logging.getLogger(\"secrets-proxy-addon\")
-
-SECRETS = ''' + repr(secrets_map) + '''
-ALLOWED_HOSTS = ''' + repr(allowed_hosts) + '''
-
-def _host_allowed(host):
-    host = host.lower()
-    for p in ALLOWED_HOSTS:
-        if p.startswith(\"*.\"):
-            if host.endswith(p[1:]) or host == p[2:]:
-                return True
-        elif host == p.lower():
-            return True
-    return False
-
-def _host_matches(host, hosts):
-    host = host.lower()
-    for p in hosts:
-        if p.startswith(\"*.\"):
-            if host.endswith(p[1:]) or host == p[2:]:
-                return True
-        elif host == p.lower():
-            return True
-    return False
-
-def request(flow):
-    host = flow.request.pretty_host
-    if not _host_allowed(host):
-        flow.response = http.Response.make(403, f\"blocked: {host}\".encode())
-        logger.info(\"Blocked: %s\", host)
-        return
-    for hname in list(flow.request.headers.keys()):
-        hval = flow.request.headers[hname]
-        for placeholder, info in SECRETS.items():
-            if placeholder in hval and _host_matches(host, info[\"hosts\"]):
-                flow.request.headers[hname] = hval.replace(placeholder, info[\"value\"])
-                logger.info(\"Injected %s for %s\", info[\"name\"], host)
-                hval = flow.request.headers[hname]
-    if flow.request.content:
-        try:
-            body = flow.request.content.decode()
-            for placeholder, info in SECRETS.items():
-                if placeholder in body and _host_matches(host, info[\"hosts\"]):
-                    body = body.replace(placeholder, info[\"value\"])
-            flow.request.content = body.encode()
-        except:
-            pass
-
-def _redact_secret_values(text):
-    count = 0
-    for placeholder, info in SECRETS.items():
-        if info[\"value\"] in text:
-            text = text.replace(info[\"value\"], \"[REDACTED:\" + info[\"name\"] + \"]\")
-            count += 1
-            logger.warning(\"Redacted %s from response (reflection prevention)\", info[\"name\"])
-    return text, count
-
-def response(flow):
-    if flow.response is None:
-        return
-    for hname in list(flow.response.headers.keys()):
-        hval = flow.response.headers[hname]
-        new_val, n = _redact_secret_values(hval)
-        if n > 0:
-            flow.response.headers[hname] = new_val
-    if flow.response.content:
-        try:
-            body = flow.response.content.decode()
-            new_body, n = _redact_secret_values(body)
-            if n > 0:
-                flow.response.content = new_body.encode()
-                if \"Content-Length\" in flow.response.headers:
-                    flow.response.headers[\"Content-Length\"] = str(len(flow.response.content))
-        except:
-            pass
-'''
-print(addon)
-" > "$ADDON_SCRIPT"
-
-echo "[secrets-proxy] Addon script generated"
+echo "[secrets-proxy] Addon configured (using production SecretsProxyAddon)"
 
 # ── Create combined CA bundle ──────────────────────────────────
 
@@ -236,7 +130,7 @@ cleanup() {
     kill $PROXY_PID 2>/dev/null || true
     wait $PROXY_PID 2>/dev/null || true
     nft delete table inet "$NFT_CHAIN" 2>/dev/null || true
-    rm -f "$ADDON_SCRIPT" "$CA_BUNDLE" /tmp/sandbox_env.sh
+    rm -f "$CA_BUNDLE" /tmp/sandbox_env.sh
     echo "[secrets-proxy] Done"
 }
 trap cleanup EXIT
