@@ -24,6 +24,7 @@ import os
 import platform
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -191,6 +192,46 @@ def _setup_nftables(sandbox_uid: int, proxy_port: int) -> bool:
         return False
 
 
+def _can_set_so_mark() -> bool:
+    """Check whether SO_MARK can be set (requires CAP_NET_ADMIN on Linux)."""
+    if platform.system() != "Linux":
+        return False
+    if not hasattr(socket, "SO_MARK"):
+        logger.error("SO_MARK is unavailable. Cannot use nftables enforcement.")
+        return False
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, _PROXY_MARK)
+        return True
+    except PermissionError:
+        logger.error("CAP_NET_ADMIN required for SO_MARK. Cannot use nftables enforcement.")
+        return False
+    except OSError as exc:
+        logger.error("SO_MARK check failed: %s. Cannot use nftables enforcement.", exc)
+        return False
+    finally:
+        s.close()
+
+
+def _select_network_enforcement(sandbox_uid: int, proxy_port: int) -> bool:
+    """Enable nftables only when SO_MARK capability checks pass."""
+    if platform.system() != "Linux":
+        logger.info("Network enforcement mode: env-var-only (non-Linux platform)")
+        return False
+
+    if not _can_set_so_mark():
+        logger.info("Network enforcement mode: env-var-only (SO_MARK unavailable)")
+        return False
+
+    used_nftables = _setup_nftables(sandbox_uid, proxy_port)
+    if used_nftables:
+        logger.info("Network enforcement mode: nftables active")
+    else:
+        logger.info("Network enforcement mode: env-var-only (nftables setup failed)")
+    return used_nftables
+
+
 def _teardown_nftables(sandbox_uid: int, proxy_port: int) -> None:
     """Remove only the nftables table created by secrets-proxy. Best-effort.
 
@@ -307,7 +348,7 @@ def run(
     # Step 5: Try nftables (Linux strong mode) BEFORE starting proxy
     # so we know which mitmproxy mode to use.
     uid = os.getuid()
-    used_nftables = _setup_nftables(uid, port)
+    used_nftables = _select_network_enforcement(uid, port)
 
     # Step 6: Start mitmproxy — transparent mode when nftables is active
     proxy_proc = start_proxy(

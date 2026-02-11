@@ -266,6 +266,8 @@ class SecretsProxyAddon:
                         host, flow.request.path,
                     )
 
+        setattr(flow, "_secrets_proxy_request_had_substitutions", total_subs > 0)
+
         if total_subs > 0:
             self._stats["substituted"] += 1
             logger.info(
@@ -298,6 +300,10 @@ class SecretsProxyAddon:
                 )
         return text, count
 
+    def _text_contains_any_secret_value(self, text: str) -> bool:
+        """Return True if text contains any configured real secret value."""
+        return any(entry.value in text for entry in self.config.secrets.values())
+
     def response(self, flow: http.HTTPFlow) -> None:
         """Scrub real secret values from responses to prevent reflection attacks.
 
@@ -329,6 +335,40 @@ class SecretsProxyAddon:
             # Decompress if needed
             encoding_tokens = [t.strip() for t in content_encoding.split(",")]
             active_encodings = [t for t in encoding_tokens if t and t != "identity"]
+
+            # If Brotli is present but unavailable, fail closed only when
+            # response scrubbing is required to prevent reflected secret leaks.
+            if "br" in active_encodings and not _HAS_BROTLI:
+                scrub_required = bool(
+                    getattr(flow, "_secrets_proxy_request_had_substitutions", False)
+                )
+                try:
+                    if self._text_contains_any_secret_value(body_bytes.decode("utf-8")):
+                        scrub_required = True
+                except UnicodeDecodeError:
+                    pass
+
+                if scrub_required:
+                    logger.error(
+                        "audit action=block_response host=%s path=%s status=502 "
+                        "reason=brotli_unavailable_scrub_required",
+                        flow.request.pretty_host,
+                        flow.request.path,
+                    )
+                    flow.response = http.Response.make(
+                        502,
+                        b"secrets-proxy: blocked Brotli response because scrubbing is unavailable",
+                        {"Content-Type": "text/plain"},
+                    )
+                    return
+
+                logger.warning(
+                    "audit action=pass_response host=%s path=%s "
+                    "reason=brotli_unavailable_no_scrub_needed",
+                    flow.request.pretty_host,
+                    flow.request.path,
+                )
+                return
 
             for enc in reversed(active_encodings):
                 decompressed = self._try_decompress(body_bytes, enc)
