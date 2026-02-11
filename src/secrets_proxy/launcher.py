@@ -509,6 +509,7 @@ def run(
     try:
         # Step 7: Build environment for sandboxed process
         sandbox_env = os.environ.copy()
+        sandbox_env.pop("SECRETS_PROXY_CONFIG_JSON", None)
 
         # Placeholder env vars (secrets)
         sandbox_env.update(config.get_env_vars())
@@ -545,5 +546,4 @@ def run(
 
     finally:
         _cleanup()
-
 

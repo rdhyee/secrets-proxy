@@ -113,6 +113,24 @@ class TestLoadConfigFromDict:
         assert "extra.com" in config.allowed_hosts
         assert "a.com" in config.allowed_hosts
 
+    def test_duplicate_placeholder_rejected(self):
+        raw = {
+            "KEY_A": {"value": "a", "hosts": ["a.com"], "placeholder": "SAME"},
+            "KEY_B": {"value": "b", "hosts": ["b.com"], "placeholder": "SAME"},
+        }
+        with pytest.raises(ValueError, match="Duplicate placeholder"):
+            load_config_from_dict(raw)
+
+    def test_non_string_host_rejected(self):
+        raw = {"KEY": {"value": "v", "hosts": ["a.com", 123]}}
+        with pytest.raises(TypeError, match="hosts"):
+            load_config_from_dict(raw)
+
+    def test_non_string_value_rejected(self):
+        raw = {"KEY": {"value": 123, "hosts": ["a.com"]}}
+        with pytest.raises(TypeError, match="'value' must be a string"):
+            load_config_from_dict(raw)
+
 
 class TestAddonEntryLoadConfig:
     """Test _load_config_from_env from addon_entry.
@@ -248,6 +266,22 @@ class TestInitSandboxEnvSafety:
         )
         assert result.stdout == "$(touch /tmp/pwned)"
 
+    def test_sandbox_env_write_does_not_follow_symlink(self, tmp_path):
+        """init should replace the symlink path itself, not overwrite the symlink target."""
+        sensitive = tmp_path / "sensitive.txt"
+        sensitive.write_text("do-not-touch")
+        env_file = tmp_path / "sandbox_env.sh"
+        env_file.symlink_to(sensitive)
+
+        raw = {"KEY": {"value": "v", "hosts": ["a.com"]}}
+        from secrets_proxy.__main__ import main
+
+        rc = main(["init", "--config-json", json.dumps(raw), "--sandbox-env", str(env_file)])
+        assert rc == 0
+        assert sensitive.read_text() == "do-not-touch"
+        assert not env_file.is_symlink()
+        assert "export KEY=" in env_file.read_text()
+
 
 class TestFromEnvJson:
     """Test ProxyConfig.from_env_json() classmethod."""
@@ -283,6 +317,43 @@ class TestFromEnvJson:
         config = load_config_from_dict(raw, allow_ip_literals=True)
         restored = ProxyConfig.from_env_json(config.to_env_json())
         assert restored.allow_ip_literals is True
+
+    def test_duplicate_secret_name_rejected(self):
+        env_json = json.dumps(
+            {
+                "secrets": {
+                    "PLACEHOLDER_A": {
+                        "name": "DUP",
+                        "value": "a",
+                        "hosts": ["a.com"],
+                    },
+                    "PLACEHOLDER_B": {
+                        "name": "DUP",
+                        "value": "b",
+                        "hosts": ["b.com"],
+                    },
+                },
+                "allowed_hosts": ["a.com", "b.com"],
+            }
+        )
+        with pytest.raises(ValueError, match="duplicate secret name"):
+            ProxyConfig.from_env_json(env_json)
+
+    def test_non_list_allowed_hosts_rejected(self):
+        env_json = json.dumps(
+            {
+                "secrets": {
+                    "PLACEHOLDER_A": {
+                        "name": "KEY",
+                        "value": "a",
+                        "hosts": ["a.com"],
+                    }
+                },
+                "allowed_hosts": "a.com",
+            }
+        )
+        with pytest.raises(TypeError, match="allowed_hosts"):
+            ProxyConfig.from_env_json(env_json)
 
 
 class TestInitErrorHandling:

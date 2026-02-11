@@ -5,12 +5,37 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shlex
 import sys
+import tempfile
 from pathlib import Path
 
-from .config import load_config, load_config_from_dict
+from .config import ProxyConfig, load_config, load_config_from_dict
 from .launcher import _check_config_permissions, cleanup_nftables_chains, run
+
+
+def _write_sandbox_env_file(path: str | Path, config: ProxyConfig) -> None:
+    """Write sandbox placeholder exports atomically to avoid path races."""
+    target = Path(path)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=str(target.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for entry in config.secrets.values():
+                f.write(f"export {entry.name}={shlex.quote(entry.placeholder)}\n")
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _handle_init(args: argparse.Namespace) -> int:
@@ -39,9 +64,7 @@ def _handle_init(args: argparse.Namespace) -> int:
 
         # Write sandbox env file (export NAME=<shell-escaped placeholder>)
         if args.sandbox_env:
-            with open(args.sandbox_env, "w") as f:
-                for entry in config.secrets.values():
-                    f.write(f'export {entry.name}={shlex.quote(entry.placeholder)}\n')
+            _write_sandbox_env_file(args.sandbox_env, config)
 
         # Print config JSON to stdout for shell capture
         print(config.to_env_json())

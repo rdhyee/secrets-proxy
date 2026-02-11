@@ -15,9 +15,19 @@ NFT_CHAIN="secrets_proxy"
 MITMDUMP="/.sprite/languages/python/pyenv/versions/3.13.7/bin/mitmdump"
 PYTHON3="/.sprite/languages/python/pyenv/versions/3.13.7/bin/python3"
 
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <config_json> -- <command>" >&2
+    exit 1
+fi
+
 CONFIG_JSON="$1"
 shift
-if [[ "$1" == "--" ]]; then shift; fi
+if [[ "${1:-}" == "--" ]]; then shift; fi
+if [[ $# -eq 0 ]]; then
+    echo "[secrets-proxy] ERROR: No command specified" >&2
+    echo "Usage: $0 <config_json> -- <command>" >&2
+    exit 1
+fi
 
 echo "[secrets-proxy] Starting on Sprite (proxy_port=$PROXY_PORT, sandbox_uid=$SANDBOX_UID)"
 
@@ -148,18 +158,22 @@ echo "[secrets-proxy] Running as '$SANDBOX_USER': $*"
 echo "────────────────────────────────────────"
 
 PROXY_URL="http://127.0.0.1:$PROXY_PORT"
-su "$SANDBOX_USER" -c "
+su "$SANDBOX_USER" -s /bin/bash -c '
+    set -euo pipefail
+    ca_bundle="$1"
+    proxy_url="$2"
+    shift 2
     source /tmp/sandbox_env.sh
-    export SSL_CERT_FILE=$CA_BUNDLE
-    export REQUESTS_CA_BUNDLE=$CA_BUNDLE
-    export NODE_EXTRA_CA_CERTS=$CA_BUNDLE
-    export CURL_CA_BUNDLE=$CA_BUNDLE
-    export HTTP_PROXY=$PROXY_URL
-    export HTTPS_PROXY=$PROXY_URL
-    export http_proxy=$PROXY_URL
-    export https_proxy=$PROXY_URL
-    $*
-"
+    export SSL_CERT_FILE="$ca_bundle"
+    export REQUESTS_CA_BUNDLE="$ca_bundle"
+    export NODE_EXTRA_CA_CERTS="$ca_bundle"
+    export CURL_CA_BUNDLE="$ca_bundle"
+    export HTTP_PROXY="$proxy_url"
+    export HTTPS_PROXY="$proxy_url"
+    export http_proxy="$proxy_url"
+    export https_proxy="$proxy_url"
+    exec "$@"
+' -- "$CA_BUNDLE" "$PROXY_URL" "$@"
 EXIT_CODE=$?
 
 echo "────────────────────────────────────────"
