@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import json
-import os
 import re
 import secrets
 from dataclasses import dataclass, field
@@ -37,20 +35,16 @@ def _sanitize_host(host: str) -> str:
     - Strip trailing slashes and paths
     - Strip port numbers
     """
-    # Strip URL scheme prefixes
     if host.startswith("https://"):
         host = host[len("https://"):]
     elif host.startswith("http://"):
         host = host[len("http://"):]
 
-    # Strip trailing slashes and paths
     host = host.split("/")[0]
 
-    # Strip port if present (but not for IPv6 bracket notation)
     if ":" in host and not host.startswith("["):
         host = host.rsplit(":", 1)[0]
 
-    # Lowercase
     host = host.lower()
 
     return host
@@ -69,17 +63,14 @@ def _validate_host_pattern(pattern: str) -> None:
                 f"Invalid wildcard pattern '{pattern}': wildcards must start with '*.' "
                 f"(e.g., '*.example.com'), not just '*'."
             )
-        # Validate the domain part after *.
         domain_part = pattern[2:]
-        if not domain_part or ".." in domain_part:
+        if not domain_part or ".." in domain_part or domain_part.startswith("."):
             raise ValueError(
                 f"Invalid wildcard pattern '{pattern}': domain part is invalid."
             )
 
-    # Basic hostname validation for the non-wildcard portion
     bare = pattern.lstrip("*.")
     if bare and not re.match(r'^[a-z0-9]([a-z0-9\-\.]*[a-z0-9])?$', bare):
-        # Check if it's a valid IP address
         try:
             ipaddress.ip_address(bare)
         except ValueError:
@@ -127,18 +118,9 @@ class SecretEntry:
     placeholder: str
     value: str
     hosts: list[str]
-    inject_header: str = "Authorization"
-    inject_format: str = "Bearer {value}"
 
     def matches_host(self, host: str) -> bool:
-        """Check if a host is approved for this secret.
-
-        Wildcard matching is strict about dot boundaries:
-        - *.github.com matches api.github.com
-        - *.github.com matches foo.bar.github.com
-        - *.github.com does NOT match github.com.evil.com
-        - *.github.com also matches the bare github.com
-        """
+        """Check if a host is approved for this secret."""
         host = host.lower()
         for pattern in self.hosts:
             if _matches_host_pattern(host, pattern):
@@ -154,7 +136,6 @@ class ProxyConfig:
     allowed_hosts: set[str] = field(default_factory=set)
     proxy_port: int = 8080
     allow_ip_literals: bool = False
-    # All placeholder values, for quick lookup during substitution
     _placeholder_to_secret: dict[str, SecretEntry] = field(
         default_factory=dict, repr=False
     )
@@ -174,13 +155,9 @@ class ProxyConfig:
         return found
 
     def is_host_allowed(self, host: str) -> bool:
-        """Check if a host is allowed by the allowlist.
-
-        Considers wildcard patterns, IP literal blocking, and exact matches.
-        """
+        """Check if a host is allowed by the allowlist."""
         host = host.lower()
 
-        # Block IP literals unless explicitly allowed
         if _is_ip_literal(host) and not self.allow_ip_literals:
             return False
 
@@ -207,15 +184,10 @@ def load_config(
     {
         "OPENAI_API_KEY": {
             "value": "sk-real-key",
-            "hosts": ["api.openai.com"],
-            "inject": {
-                "header": "Authorization",
-                "format": "Bearer {value}"
-            }
+            "hosts": ["api.openai.com"]
         }
     }
 
-    The "inject" field is optional (defaults to Authorization: Bearer).
     Placeholders are auto-generated at load time.
     """
     path = Path(config_path)
@@ -228,17 +200,37 @@ def load_config(
         validate_secret_name(name)
 
         if isinstance(entry_data, str):
-            # Simple format: {"OPENAI_API_KEY": "sk-real-key"}
-            # No host restriction, no injection config
             raise ValueError(
                 f"Secret '{name}' must be a dict with 'value' and 'hosts' keys, "
                 f"not a plain string. Secrets without host restrictions are not allowed."
             )
 
-        inject = entry_data.get("inject", {})
+        if not isinstance(entry_data, dict):
+            raise TypeError(
+                f"Secret '{name}': expected a dict, got {type(entry_data).__name__}"
+            )
+
+        if "value" not in entry_data:
+            raise ValueError(
+                f"Secret '{name}' is missing required key 'value'."
+            )
+        if "hosts" not in entry_data:
+            raise ValueError(
+                f"Secret '{name}' is missing required key 'hosts'. "
+                f"Every secret must be scoped to specific destination hosts."
+            )
+        if not isinstance(entry_data["hosts"], list):
+            raise TypeError(
+                f"Secret '{name}': 'hosts' must be a list of hostnames, "
+                f"got {type(entry_data['hosts']).__name__}"
+            )
+        if not entry_data["hosts"]:
+            raise ValueError(
+                f"Secret '{name}': 'hosts' list cannot be empty."
+            )
+
         placeholder = entry_data.get("placeholder", generate_placeholder(name))
 
-        # Sanitize and validate hosts
         raw_hosts = entry_data["hosts"]
         sanitized_hosts = []
         for h in raw_hosts:
@@ -251,18 +243,14 @@ def load_config(
             placeholder=placeholder,
             value=entry_data["value"],
             hosts=sanitized_hosts,
-            inject_header=inject.get("header", "Authorization"),
-            inject_format=inject.get("format", "Bearer {value}"),
         )
 
         config.secrets[name] = entry
         config._placeholder_to_secret[entry.placeholder] = entry
 
-        # Add hosts to the global allowlist
         for host in entry.hosts:
             config.allowed_hosts.add(host)
 
-    # Add any extra allowed hosts (non-secret-bearing, but reachable)
     if allow_net:
         for host in allow_net:
             host = _sanitize_host(host)

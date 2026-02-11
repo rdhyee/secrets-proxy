@@ -1,14 +1,34 @@
-"""Process launcher: starts mitmproxy, sets up environment, runs sandboxed command."""
+"""Process launcher: starts mitmproxy, sets up environment, runs sandboxed command.
+
+Network enforcement (Linux/nftables):
+    All TCP egress from the sandbox UID is redirected to the proxy port via a
+    dedicated nftables chain ("secrets_proxy"). The proxy's own outbound packets
+    are exempted using packet marks (SO_MARK / mitmproxy ``--set mark=0x1``), so
+    they reach upstream hosts directly without looping back.
+
+    UDP egress is blocked for the sandbox UID, except DNS (UDP port 53) which is
+    allowed so name resolution works. HTTP/3 (QUIC over UDP) is **not supported**
+    -- clients that attempt QUIC will fall back to HTTP/2 or HTTP/1.1 over TCP.
+
+macOS / fallback:
+    On macOS (or when nftables is unavailable), the launcher sets HTTP_PROXY /
+    HTTPS_PROXY environment variables. This is a weaker enforcement suitable for
+    local development only.
+"""
 
 from __future__ import annotations
 
+import json as _json
 import logging
 import os
 import platform
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -20,22 +40,59 @@ logger = logging.getLogger("secrets-proxy")
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 8080
 
+# Packet mark used by mitmproxy to tag its own outbound connections.
+# nftables rules skip packets carrying this mark so the proxy can reach
+# upstream hosts without being redirected back to itself.
+_PROXY_MARK = 0x1
+
+# Name of the dedicated nftables chain managed by secrets-proxy.  Using a
+# dedicated chain avoids collisions with other rules in "ip nat OUTPUT" and
+# makes teardown safe (we only flush our own chain).
+_NFT_CHAIN = "secrets_proxy"
+
+
+def _check_mitmdump() -> None:
+    """Verify that mitmdump is available on PATH.
+
+    Raises RuntimeError with a clear message if not found.
+    """
+    if shutil.which("mitmdump") is None:
+        raise RuntimeError(
+            "mitmdump not found on PATH. Install mitmproxy: "
+            "pip install mitmproxy  or  brew install mitmproxy"
+        )
+
+
+def _check_config_permissions(config_path: str | Path) -> None:
+    """Warn if the secrets config file has overly permissive permissions."""
+    try:
+        st = os.stat(config_path)
+        mode = st.st_mode
+        if mode & (stat.S_IRGRP | stat.S_IROTH):
+            logger.warning(
+                "Config file %s is readable by group/others (mode %o). "
+                "Consider: chmod 600 %s",
+                config_path, stat.S_IMODE(mode), config_path,
+            )
+    except OSError:
+        pass
+
 
 def _generate_mitmproxy_ca_if_needed() -> None:
     """Run mitmproxy briefly to generate CA certs if they don't exist."""
     if MITMPROXY_CA_CERT.exists():
         return
 
+    _check_mitmdump()
+
     logger.info("Generating mitmproxy CA certificate (first run)...")
     MITMPROXY_CA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Run mitmdump briefly to trigger CA generation
     proc = subprocess.Popen(
         ["mitmdump", "--listen-port", "0", "-q"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    # Give it a moment to generate certs
     time.sleep(2)
     proc.terminate()
     proc.wait(timeout=5)
@@ -47,36 +104,72 @@ def _generate_mitmproxy_ca_if_needed() -> None:
 
 
 def _setup_nftables(sandbox_uid: int, proxy_port: int) -> bool:
-    """Set up nftables to redirect outbound traffic through the proxy.
+    """Set up nftables to redirect **all** sandbox TCP through the proxy.
+
+    Creates a dedicated chain ``secrets_proxy`` in the ``ip nat`` table so that
+    teardown only removes our rules (not anyone else's).
+
+    The rules implement a default-deny egress policy for the sandbox UID:
+
+    1. Skip packets that carry ``_PROXY_MARK`` (these are mitmproxy's own
+       upstream connections -- without this exemption the proxy's traffic would
+       loop back to itself).
+    2. Allow traffic to the proxy listener only (127.0.0.1:proxy_port).
+    3. Redirect **all** remaining TCP from ``sandbox_uid`` to ``proxy_port``.
+    4. Drop **all** UDP from ``sandbox_uid`` except DNS (port 53).
 
     Returns True if nftables was set up, False if not available.
     Only works on Linux with root/CAP_NET_ADMIN.
+
+    Note: HTTP/3 (QUIC over UDP) is intentionally blocked.  Well-behaved HTTP
+    clients will fall back to TCP-based HTTP/2 or HTTP/1.1 automatically.
     """
     if platform.system() != "Linux":
         logger.info("Not on Linux, skipping nftables (using proxy env vars instead)")
         return False
 
     try:
-        # Redirect HTTP and HTTPS from the sandboxed user through the proxy
         cmds = [
-            # Redirect HTTPS (443) to proxy
-            [
-                "nft", "add", "rule", "ip", "nat", "OUTPUT",
-                "meta", "skuid", str(sandbox_uid),
-                "tcp", "dport", "443",
-                "redirect", "to", f":{proxy_port}",
-            ],
-            # Redirect HTTP (80) to proxy
-            [
-                "nft", "add", "rule", "ip", "nat", "OUTPUT",
-                "meta", "skuid", str(sandbox_uid),
-                "tcp", "dport", "80",
-                "redirect", "to", f":{proxy_port}",
-            ],
+            # --- Create dedicated NAT chain ---
+            ["nft", "add", "chain", "ip", "nat", _NFT_CHAIN,
+             "{ type nat hook output priority -1 ; }"],
+
+            # 1. Skip marked packets (proxy's own upstream traffic)
+            ["nft", "add", "rule", "ip", "nat", _NFT_CHAIN,
+             "meta", "mark", hex(_PROXY_MARK), "accept"],
+
+            # 2. Allow sandbox -> proxy listener ONLY (not all of localhost)
+            ["nft", "add", "rule", "ip", "nat", _NFT_CHAIN,
+             "meta", "skuid", str(sandbox_uid),
+             "ip", "daddr", "127.0.0.1", "tcp", "dport", str(proxy_port), "accept"],
+
+            # 3. Redirect all remaining TCP from sandbox UID to proxy port
+            ["nft", "add", "rule", "ip", "nat", _NFT_CHAIN,
+             "meta", "skuid", str(sandbox_uid),
+             "ip", "protocol", "tcp",
+             "redirect", "to", f":{proxy_port}"],
+
+            # --- Block UDP egress for sandbox UID (separate filter chain) ---
+            ["nft", "add", "chain", "ip", "filter", f"{_NFT_CHAIN}_filter",
+             "{ type filter hook output priority 0 ; }"],
+
+            # 4a. Allow DNS (UDP port 53) so name resolution works
+            ["nft", "add", "rule", "ip", "filter", f"{_NFT_CHAIN}_filter",
+             "meta", "skuid", str(sandbox_uid),
+             "udp", "dport", "53", "accept"],
+
+            # 4b. Drop all other UDP from sandbox UID (QUIC bypass prevention)
+            ["nft", "add", "rule", "ip", "filter", f"{_NFT_CHAIN}_filter",
+             "meta", "skuid", str(sandbox_uid),
+             "ip", "protocol", "udp",
+             "drop"],
         ]
         for cmd in cmds:
             subprocess.run(cmd, check=True, capture_output=True)
-        logger.info("nftables rules set for UID %d → port %d", sandbox_uid, proxy_port)
+        logger.info(
+            "nftables rules set for UID %d -> port %d (mark 0x%x exempt, UDP blocked except DNS)",
+            sandbox_uid, proxy_port, _PROXY_MARK,
+        )
         return True
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.warning("nftables setup failed: %s. Falling back to proxy env vars.", e)
@@ -84,45 +177,80 @@ def _setup_nftables(sandbox_uid: int, proxy_port: int) -> bool:
 
 
 def _teardown_nftables(sandbox_uid: int, proxy_port: int) -> None:
-    """Remove nftables rules. Best-effort."""
+    """Remove only the nftables chains created by secrets-proxy. Best-effort.
+
+    Flushes and deletes the dedicated ``secrets_proxy`` and
+    ``secrets_proxy_filter`` chains without touching any other rules.
+    """
     if platform.system() != "Linux":
         return
-    try:
-        subprocess.run(
-            ["nft", "flush", "chain", "ip", "nat", "OUTPUT"],
-            capture_output=True,
-        )
-        logger.info("nftables rules cleaned up")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
+    for table, chain in [("nat", _NFT_CHAIN), ("filter", f"{_NFT_CHAIN}_filter")]:
+        try:
+            subprocess.run(
+                ["nft", "flush", "chain", "ip", table, chain],
+                capture_output=True,
+            )
+            subprocess.run(
+                ["nft", "delete", "chain", "ip", table, chain],
+                capture_output=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    logger.info("nftables rules cleaned up")
 
 
-def start_proxy(config: ProxyConfig, addon_path: str) -> subprocess.Popen:
-    """Start mitmproxy in transparent mode with the secrets addon."""
+def start_proxy(
+    config: ProxyConfig,
+    addon_path: str,
+    *,
+    use_transparent: bool = False,
+) -> subprocess.Popen:
+    """Start mitmproxy with the secrets addon.
+
+    Args:
+        config: Proxy configuration.
+        addon_path: Path to the auto-generated mitmproxy addon script.
+        use_transparent: If True, use ``--mode transparent`` (required when
+            nftables redirects raw TCP to the proxy port). If False, use
+            ``--mode regular`` (for macOS / env-var proxy mode).
+
+    Uses subprocess.DEVNULL for stdout/stderr to avoid pipe deadlock.
+    """
+    _check_mitmdump()
+
+    mode = "transparent" if use_transparent else "regular"
+    port = config.proxy_port or PROXY_PORT
+
     cmd = [
         "mitmdump",
-        "--mode", "regular",
+        "--mode", mode,
         "--listen-host", PROXY_HOST,
-        "--listen-port", str(config.proxy_port or PROXY_PORT),
+        "--listen-port", str(port),
         "--set", "connection_strategy=lazy",
         "-s", addon_path,
-        "-q",  # quiet mode
+        "-q",
     ]
 
-    logger.info("Starting mitmproxy: %s", " ".join(cmd))
+    # When using transparent mode on Linux, tell mitmproxy to mark its own
+    # outbound packets so nftables can exempt them from redirection.
+    if use_transparent:
+        cmd.extend(["--set", f"mark={_PROXY_MARK}"])
+
+    logger.info("Starting mitmproxy (%s mode): %s", mode, " ".join(cmd))
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
-    # Wait for proxy to be ready
     time.sleep(1)
     if proc.poll() is not None:
-        stderr = proc.stderr.read().decode() if proc.stderr else ""
-        raise RuntimeError(f"mitmproxy failed to start: {stderr}")
+        raise RuntimeError(
+            f"mitmproxy exited immediately (code {proc.returncode}). "
+            "Check that the port is available and the addon script is valid."
+        )
 
-    logger.info("mitmproxy started (PID %d) on %s:%d", proc.pid, PROXY_HOST, config.proxy_port or PROXY_PORT)
+    logger.info("mitmproxy started (PID %d) on %s:%d", proc.pid, PROXY_HOST, port)
     return proc
 
 
@@ -134,64 +262,60 @@ def run(
 ) -> int:
     """Run a command with secrets-proxy wrapping.
 
-    1. Generate mitmproxy CA if needed
-    2. Create combined CA bundle
-    3. Write mitmproxy addon script with config
-    4. Start mitmproxy
-    5. Set up nftables (Linux) or proxy env vars (macOS)
-    6. Run the sandboxed command with placeholder env vars
-    7. Clean up
+    1. Check dependencies (mitmdump on PATH)
+    2. Generate mitmproxy CA if needed
+    3. Create combined CA bundle (temp file, no root needed)
+    4. Write mitmproxy addon script (secrets via env var, not on disk)
+    5. Set up nftables (Linux) or prepare proxy env vars (macOS)
+    6. Start mitmproxy (transparent if nftables, regular otherwise)
+    7. Run the sandboxed command with placeholder env vars
+    8. Clean up (nftables, proxy, temp files)
 
     Returns the sandboxed command's exit code.
     """
     port = config.proxy_port or PROXY_PORT
 
-    # Step 1: Ensure CA exists
+    # Step 1: Check dependencies
+    _check_mitmdump()
+
+    # Step 2: Ensure CA exists
     _generate_mitmproxy_ca_if_needed()
 
-    # Step 2: Create combined CA bundle
+    # Step 3: Create combined CA bundle (temp file — no root needed)
     bundle_path, ca_env = setup_ca_trust(ca_bundle_path)
     logger.info("CA bundle created at %s", bundle_path)
 
-    # Step 3: Write addon script with embedded config
+    # Step 4: Write addon script (secrets passed via env var, not in file)
     addon_script = _create_addon_script(config)
 
-    # Step 4: Start mitmproxy
-    proxy_proc = start_proxy(config, addon_script)
+    # Step 5: Try nftables (Linux strong mode) BEFORE starting proxy
+    # so we know which mitmproxy mode to use.
+    uid = os.getuid()
+    used_nftables = _setup_nftables(uid, port)
 
-    try:
-        # Step 5: Build environment for sandboxed process
-        sandbox_env = os.environ.copy()
+    # Step 6: Start mitmproxy — transparent mode when nftables is active
+    proxy_proc = start_proxy(
+        config, addon_script, use_transparent=used_nftables,
+    )
 
-        # Placeholder env vars (secrets)
-        sandbox_env.update(config.get_env_vars())
+    # Sandbox process reference for health monitor
+    sandbox_proc: subprocess.Popen | None = None
 
-        # CA trust env vars
-        sandbox_env.update(ca_env)
+    def _proxy_health_monitor() -> None:
+        """Background thread: kill sandbox if proxy dies unexpectedly."""
+        while True:
+            time.sleep(1)
+            if proxy_proc.poll() is not None:
+                logger.error(
+                    "mitmproxy died (exit %d) — killing sandbox for fail-closed safety",
+                    proxy_proc.returncode,
+                )
+                if sandbox_proc and sandbox_proc.poll() is None:
+                    sandbox_proc.kill()
+                return
 
-        # Proxy env vars (for macOS / non-nftables mode)
-        proxy_url = f"http://{PROXY_HOST}:{port}"
-        sandbox_env["HTTP_PROXY"] = proxy_url
-        sandbox_env["HTTPS_PROXY"] = proxy_url
-        sandbox_env["http_proxy"] = proxy_url
-        sandbox_env["https_proxy"] = proxy_url
-
-        # Try nftables (Linux strong mode)
-        uid = os.getuid()
-        used_nftables = _setup_nftables(uid, port)
-
-        # Step 6: Run the sandboxed command
-        logger.info("Running: %s", " ".join(command))
-        try:
-            result = subprocess.run(command, env=sandbox_env)
-            return result.returncode
-        finally:
-            # Step 7: Clean up
-            if used_nftables:
-                _teardown_nftables(uid, port)
-
-    finally:
-        # Stop mitmproxy
+    def _cleanup() -> None:
+        """Best-effort cleanup of all resources."""
         proxy_proc.terminate()
         try:
             proxy_proc.wait(timeout=5)
@@ -200,20 +324,77 @@ def run(
             proxy_proc.wait()
         logger.info("mitmproxy stopped")
 
-        # Clean up addon script
+        if used_nftables:
+            _teardown_nftables(uid, port)
+
+        for path in [addon_script, str(bundle_path)]:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        os.environ.pop("SECRETS_PROXY_CONFIG_JSON", None)
+
+    def _signal_handler(signum: int, frame: object) -> None:
+        logger.info("Received signal %d, cleaning up...", signum)
+        _cleanup()
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    try:
+        # Step 7: Build environment for sandboxed process
+        sandbox_env = os.environ.copy()
+
+        # Placeholder env vars (secrets)
+        sandbox_env.update(config.get_env_vars())
+
+        # CA trust env vars
+        sandbox_env.update(ca_env)
+
+        # Remove the config JSON from child env (addon already read it)
+        sandbox_env.pop("SECRETS_PROXY_CONFIG_JSON", None)
+
+        # Proxy env vars (harmless when nftables is active,
+        # primary enforcement mechanism on macOS)
+        proxy_url = f"http://{PROXY_HOST}:{port}"
+        sandbox_env["HTTP_PROXY"] = proxy_url
+        sandbox_env["HTTPS_PROXY"] = proxy_url
+        sandbox_env["http_proxy"] = proxy_url
+        sandbox_env["https_proxy"] = proxy_url
+
+        # Start health monitor
+        monitor = threading.Thread(target=_proxy_health_monitor, daemon=True)
+        monitor.start()
+
+        # Step 8: Run the sandboxed command
+        logger.info("Running: %s", " ".join(command))
         try:
-            os.unlink(addon_script)
-        except OSError:
-            pass
+            sandbox_proc = subprocess.Popen(command, env=sandbox_env)
+            sandbox_proc.wait()
+            return sandbox_proc.returncode
+        finally:
+            if sandbox_proc and sandbox_proc.poll() is None:
+                sandbox_proc.terminate()
+                try:
+                    sandbox_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    sandbox_proc.kill()
+
+    finally:
+        _cleanup()
 
 
 def _create_addon_script(config: ProxyConfig) -> str:
-    """Create a temporary mitmproxy addon script with embedded config.
+    """Create a temporary mitmproxy addon script.
 
-    We serialize the config into the script so mitmproxy can load it
-    as a standalone addon without needing to import secrets_proxy.
+    Secrets are passed via the SECRETS_PROXY_CONFIG_JSON environment variable
+    (not embedded in the script file) so that real credentials are never
+    written to disk.
     """
-    # Serialize the minimal config needed by the addon
+    allowed_hosts = list(config.allowed_hosts)
+
     secrets_data = {}
     for name, entry in config.secrets.items():
         secrets_data[entry.placeholder] = {
@@ -221,24 +402,37 @@ def _create_addon_script(config: ProxyConfig) -> str:
             "value": entry.value,
             "hosts": entry.hosts,
         }
+    os.environ["SECRETS_PROXY_CONFIG_JSON"] = _json.dumps({
+        "secrets": secrets_data,
+        "allowed_hosts": allowed_hosts,
+    })
 
-    allowed_hosts = list(config.allowed_hosts)
+    script_content = '''"""Auto-generated mitmproxy addon for secrets-proxy.
 
-    script_content = f'''"""Auto-generated mitmproxy addon for secrets-proxy."""
+Reads config from SECRETS_PROXY_CONFIG_JSON env var (secrets never touch disk).
+"""
+import json
 import logging
+import os
+
 from mitmproxy import http
 
 logger = logging.getLogger("secrets-proxy-addon")
 
-SECRETS = {secrets_data!r}
-ALLOWED_HOSTS = {allowed_hosts!r}
+_config = json.loads(os.environ["SECRETS_PROXY_CONFIG_JSON"])
+SECRETS = _config["secrets"]
+ALLOWED_HOSTS = _config["allowed_hosts"]
+# Clear from env immediately so child processes don't inherit it
+del os.environ["SECRETS_PROXY_CONFIG_JSON"]
 
 
 def _host_allowed(host: str) -> bool:
+    host = host.lower()
     for pattern in ALLOWED_HOSTS:
         if pattern.startswith("*."):
             suffix = pattern[1:]
-            if host.endswith(suffix) or host == pattern[2:]:
+            base = pattern[2:]
+            if host == base or (host.endswith(suffix) and len(host) > len(suffix)):
                 return True
         elif host == pattern:
             return True
@@ -246,10 +440,12 @@ def _host_allowed(host: str) -> bool:
 
 
 def _host_matches_secret(host: str, hosts: list) -> bool:
+    host = host.lower()
     for pattern in hosts:
         if pattern.startswith("*."):
             suffix = pattern[1:]
-            if host.endswith(suffix) or host == pattern[2:]:
+            base = pattern[2:]
+            if host == base or (host.endswith(suffix) and len(host) > len(suffix)):
                 return True
         elif host == pattern:
             return True
@@ -262,10 +458,10 @@ def request(flow: http.HTTPFlow) -> None:
     if not _host_allowed(host):
         flow.response = http.Response.make(
             403,
-            f"secrets-proxy: host '{{host}}' not in allowlist".encode(),
-            {{"Content-Type": "text/plain"}},
+            f"secrets-proxy: host \\'{host}\\' not in allowlist".encode(),
+            {"Content-Type": "text/plain"},
         )
-        logger.info("Blocked: %s", host)
+        logger.info("audit action=block host=%s path=%s method=%s", host, flow.request.path, flow.request.method)
         return
 
     def substitute(text: str) -> tuple[str, int]:
@@ -274,8 +470,10 @@ def request(flow: http.HTTPFlow) -> None:
             if placeholder in text and _host_matches_secret(host, info["hosts"]):
                 text = text.replace(placeholder, info["value"])
                 count += 1
-                logger.info("Injected secret '%s' for %s", info["name"], host)
+                logger.info("Injected secret \\'%s\\' for %s", info["name"], host)
         return text, count
+
+    total_subs = 0
 
     # Substitute in headers
     for hname in list(flow.request.headers.keys()):
@@ -283,12 +481,14 @@ def request(flow: http.HTTPFlow) -> None:
         new_val, n = substitute(hval)
         if n > 0:
             flow.request.headers[hname] = new_val
+            total_subs += n
 
-    # Substitute in URL
+    # Substitute in URL (query params)
     if flow.request.url:
         new_url, n = substitute(flow.request.url)
         if n > 0:
             flow.request.url = new_url
+            total_subs += n
 
     # Substitute in body
     if flow.request.content:
@@ -297,11 +497,19 @@ def request(flow: http.HTTPFlow) -> None:
             new_body, n = substitute(body)
             if n > 0:
                 flow.request.content = new_body.encode("utf-8")
+                # Let mitmproxy recalculate Content-Length
+                if "Content-Length" in flow.request.headers:
+                    flow.request.headers["Content-Length"] = str(len(flow.request.content))
+                total_subs += n
         except UnicodeDecodeError:
-            pass
+            logger.warning("audit action=skip_body host=%s path=%s reason=binary_content", host, flow.request.path)
+
+    if total_subs > 0:
+        logger.info("audit action=substitute host=%s path=%s secrets_injected=%d method=%s", host, flow.request.path, total_subs, flow.request.method)
+    else:
+        logger.debug("audit action=pass host=%s path=%s method=%s", host, flow.request.path, flow.request.method)
 '''
 
-    # Write to temp file
     fd, path = tempfile.mkstemp(suffix=".py", prefix="secrets_proxy_addon_")
     with os.fdopen(fd, "w") as f:
         f.write(script_content)

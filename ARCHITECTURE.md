@@ -81,20 +81,38 @@ class SecretsProxyAddon:
 
 ### 3. Traffic Enforcement (nftables)
 
-On Linux (Sprites, Docker), nftables rules redirect all outbound traffic through the proxy:
+On Linux (Sprites, Docker), nftables rules redirect all outbound traffic through the proxy. Rules are installed in a dedicated chain (`secrets_proxy`) so that teardown only removes our rules.
 
 ```bash
-# Create network namespace or use nftables redirect
-# All TCP traffic from sandboxed process → proxy port
-nft add rule ip nat OUTPUT \
-  -m owner --uid-owner $SANDBOX_UID \
-  -p tcp --dport 443 \
-  -j REDIRECT --to-port $PROXY_PORT
+# Dedicated NAT chain (output hook, priority -1)
+nft add chain ip nat secrets_proxy '{ type nat hook output priority -1 ; }'
+
+# 1. Skip packets marked by the proxy (prevents infinite redirect loop)
+nft add rule ip nat secrets_proxy meta mark 0x1 accept
+
+# 2. Allow sandbox -> proxy listener ONLY (not all of localhost)
+nft add rule ip nat secrets_proxy meta skuid $SANDBOX_UID ip daddr 127.0.0.1 tcp dport $PROXY_PORT accept
+
+# 3. Redirect ALL remaining TCP from sandbox UID to proxy port
+nft add rule ip nat secrets_proxy meta skuid $SANDBOX_UID ip protocol tcp redirect to :$PROXY_PORT
+
+# 4. Allow DNS (UDP:53) but block all other UDP (prevents QUIC bypass)
+nft add chain ip filter secrets_proxy_filter '{ type filter hook output priority 0 ; }'
+nft add rule ip filter secrets_proxy_filter meta skuid $SANDBOX_UID udp dport 53 accept
+nft add rule ip filter secrets_proxy_filter meta skuid $SANDBOX_UID ip protocol udp drop
 ```
 
-This is the "strong jail" — the sandboxed process literally cannot bypass the proxy at the kernel level. (Inspired by httpjail's Linux enforcement.)
+**Key design decisions:**
 
-On macOS (local dev), falls back to `HTTP_PROXY`/`HTTPS_PROXY` environment variables (weaker, but fine for testing).
+- **Packet marking to prevent self-loop**: mitmproxy is started with `--set mark=0x1`. Its outbound connections carry this mark in the IP header, which the first nftables rule matches and accepts. Without this, the proxy's upstream traffic would be redirected back to itself in an infinite loop.
+- **All TCP, not just 443/80**: Redirecting only ports 443 and 80 would miss API calls on non-standard ports. All TCP is redirected.
+- **UDP blocked except DNS**: HTTP/3 (QUIC) runs over UDP and would bypass the MITM proxy. All UDP except port 53 (DNS) is blocked, forcing clients to fall back to TCP-based HTTP/2 or HTTP/1.1. DNS queries are allowed so name resolution works; DNS-based exfiltration remains a known limitation (future: DNS filtering).
+- **Dedicated chain**: Using a dedicated `secrets_proxy` chain (rather than adding rules to the system `OUTPUT` chain) means teardown only flushes our rules without disrupting other nftables configuration.
+- **Transparent mode**: nftables redirect sends raw TCP (not HTTP CONNECT) to the proxy port, so mitmproxy must run in `--mode transparent` (not `--mode regular`).
+
+This is the "strong jail" -- the sandboxed process literally cannot bypass the proxy at the kernel level. (Inspired by httpjail's Linux enforcement.)
+
+On macOS (local dev), falls back to `HTTP_PROXY`/`HTTPS_PROXY` environment variables (weaker, but fine for testing). mitmproxy runs in `--mode regular` in this case.
 
 ### 4. CA Trust Setup
 
@@ -148,8 +166,11 @@ Steps:
 ### Threat: Sandbox code inspects proxy process memory
 **Mitigation**: The proxy runs as a different user. On Sprites, the sandboxed process runs as an unprivileged user that cannot ptrace or read /proc of the proxy process.
 
+### Threat: Sandbox accesses local services (SSH, databases)
+**Mitigation**: nftables rules allow loopback traffic only to the proxy port (127.0.0.1:$PROXY_PORT), not all of localhost. All other localhost connections are redirected through the proxy and blocked.
+
 ### Threat: DNS-based exfiltration
-**Mitigation**: (Future) DNS filtering or forwarding through the proxy.
+**Mitigation**: DNS (UDP:53) is allowed for name resolution. DNS-based exfiltration remains a known limitation. Future: DNS filtering or forwarding through the proxy.
 
 ### What this does NOT protect against
 - Sandbox code with root access (can modify nftables, read proxy memory)

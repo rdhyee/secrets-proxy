@@ -73,6 +73,9 @@ def main(argv: list[str] | None = None) -> int:
             print("Error: no command specified. Usage: secrets-proxy run --config secrets.json -- <command>", file=sys.stderr)
             return 1
 
+        from .launcher import _check_config_permissions
+        _check_config_permissions(args.config)
+
         config = load_config(args.config, allow_net=args.allow_net)
         config.proxy_port = args.port
 
