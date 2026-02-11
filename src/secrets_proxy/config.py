@@ -57,6 +57,9 @@ def _validate_host_pattern(pattern: str) -> None:
     - Wildcards must start with '*.' (not just '*')
     - Hostname must use valid characters
     """
+    if not pattern:
+        raise ValueError("Host pattern cannot be empty.")
+
     if pattern.startswith("*"):
         if not pattern.startswith("*."):
             raise ValueError(
@@ -144,6 +147,103 @@ class ProxyConfig:
         """Return env vars to set in the sandboxed process (placeholder values)."""
         return {entry.name: entry.placeholder for entry in self.secrets.values()}
 
+    def to_env_json(self) -> str:
+        """Serialize config to JSON for SECRETS_PROXY_CONFIG_JSON env var.
+
+        Format consumed by addon_entry.py:
+        {
+            "secrets": {
+                "PLACEHOLDER_HEX": {
+                    "name": "SECRET_NAME",
+                    "value": "real-value",
+                    "hosts": ["api.example.com"]
+                }
+            },
+            "allowed_hosts": ["api.example.com", ...]
+        }
+        """
+        secrets_data = {}
+        for _name, entry in self.secrets.items():
+            secrets_data[entry.placeholder] = {
+                "name": entry.name,
+                "value": entry.value,
+                "hosts": entry.hosts,
+            }
+        return json.dumps({
+            "secrets": secrets_data,
+            "allowed_hosts": sorted(self.allowed_hosts),
+            "allow_ip_literals": self.allow_ip_literals,
+        })
+
+    @classmethod
+    def from_env_json(cls, env_json: str) -> "ProxyConfig":
+        """Reconstruct a ProxyConfig from the JSON produced by to_env_json().
+
+        This is the canonical deserialization path used by addon_entry.py.
+        Keeps all reconstruction logic in one place (config.py) rather than
+        having addon_entry.py manually build ProxyConfig internals.
+        """
+        data = json.loads(env_json)
+
+        if not isinstance(data, dict):
+            raise TypeError("Invalid env config: top-level JSON value must be an object.")
+
+        allow_ip_literals = data.get("allow_ip_literals", False)
+        if not isinstance(allow_ip_literals, bool):
+            raise TypeError("Invalid env config: 'allow_ip_literals' must be a boolean.")
+
+        secrets_data = data.get("secrets", {})
+        if not isinstance(secrets_data, dict):
+            raise TypeError("Invalid env config: 'secrets' must be an object.")
+
+        raw: dict[str, dict[str, object]] = {}
+        for placeholder, info in secrets_data.items():
+            if not isinstance(placeholder, str):
+                raise TypeError("Invalid env config: secret placeholder keys must be strings.")
+            if not placeholder:
+                raise ValueError("Invalid env config: secret placeholders cannot be empty.")
+            if not isinstance(info, dict):
+                raise TypeError(
+                    f"Invalid env config: secret entry for placeholder '{placeholder}' must be an object."
+                )
+
+            name = info.get("name")
+            if not isinstance(name, str):
+                raise TypeError(
+                    f"Invalid env config: secret entry for placeholder '{placeholder}' is missing string 'name'."
+                )
+            if name in raw:
+                raise ValueError(
+                    f"Invalid env config: duplicate secret name '{name}' across placeholders."
+                )
+            if "value" not in info or "hosts" not in info:
+                raise ValueError(
+                    f"Invalid env config: secret '{name}' must include 'value' and 'hosts'."
+                )
+
+            raw[name] = {
+                "value": info["value"],
+                "hosts": info["hosts"],
+                "placeholder": placeholder,
+            }
+
+        config = _build_config_from_dict(
+            raw,
+            allow_ip_literals=allow_ip_literals,
+        )
+
+        allowed_hosts = data.get("allowed_hosts", [])
+        if not isinstance(allowed_hosts, list):
+            raise TypeError("Invalid env config: 'allowed_hosts' must be a list.")
+        for host in allowed_hosts:
+            if not isinstance(host, str):
+                raise TypeError("Invalid env config: all allowed_hosts entries must be strings.")
+            host = _sanitize_host(host)
+            _validate_host_pattern(host)
+            config.allowed_hosts.add(host)
+
+        return config
+
     def find_secret_for_placeholder(
         self, text: str
     ) -> list[tuple[str, SecretEntry]]:
@@ -173,28 +273,23 @@ def generate_placeholder(name: str) -> str:
     return f"SECRETS_PROXY_PLACEHOLDER_{random_hex}"
 
 
-def load_config(
-    config_path: str | Path,
+def _build_config_from_dict(
+    raw: dict,
     allow_net: list[str] | None = None,
     allow_ip_literals: bool = False,
 ) -> ProxyConfig:
-    """Load secret configuration from a JSON file.
+    """Build a ProxyConfig from a raw config dict.
 
-    Config format:
-    {
-        "OPENAI_API_KEY": {
-            "value": "sk-real-key",
-            "hosts": ["api.openai.com"]
-        }
-    }
-
-    Placeholders are auto-generated at load time.
+    Shared implementation for load_config() and load_config_from_dict().
+    All validation (secret names, host patterns) is applied here.
     """
-    path = Path(config_path)
-    with open(path) as f:
-        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise TypeError(
+            f"Config must be a JSON object mapping secret names to entries, got {type(raw).__name__}."
+        )
 
     config = ProxyConfig(allow_ip_literals=allow_ip_literals)
+    seen_placeholders: set[str] = set()
 
     for name, entry_data in raw.items():
         validate_secret_name(name)
@@ -219,6 +314,11 @@ def load_config(
                 f"Secret '{name}' is missing required key 'hosts'. "
                 f"Every secret must be scoped to specific destination hosts."
             )
+        if not isinstance(entry_data["value"], str):
+            raise TypeError(
+                f"Secret '{name}': 'value' must be a string, "
+                f"got {type(entry_data['value']).__name__}"
+            )
         if not isinstance(entry_data["hosts"], list):
             raise TypeError(
                 f"Secret '{name}': 'hosts' must be a list of hostnames, "
@@ -230,10 +330,28 @@ def load_config(
             )
 
         placeholder = entry_data.get("placeholder", generate_placeholder(name))
+        if not isinstance(placeholder, str):
+            raise TypeError(
+                f"Secret '{name}': 'placeholder' must be a string, "
+                f"got {type(placeholder).__name__}"
+            )
+        if not placeholder:
+            raise ValueError(f"Secret '{name}': 'placeholder' cannot be empty.")
+        if placeholder in seen_placeholders:
+            raise ValueError(
+                f"Duplicate placeholder detected: {placeholder!r}. "
+                "Each secret must have a unique placeholder."
+            )
+        seen_placeholders.add(placeholder)
 
         raw_hosts = entry_data["hosts"]
         sanitized_hosts = []
         for h in raw_hosts:
+            if not isinstance(h, str):
+                raise TypeError(
+                    f"Secret '{name}': all 'hosts' entries must be strings, "
+                    f"got {type(h).__name__}"
+                )
             h = _sanitize_host(h)
             _validate_host_pattern(h)
             sanitized_hosts.append(h)
@@ -253,8 +371,58 @@ def load_config(
 
     if allow_net:
         for host in allow_net:
+            if not isinstance(host, str):
+                raise TypeError(
+                    f"'allow_net' entries must be strings, got {type(host).__name__}"
+                )
             host = _sanitize_host(host)
             _validate_host_pattern(host)
             config.allowed_hosts.add(host)
 
     return config
+
+
+def load_config(
+    config_path: str | Path,
+    allow_net: list[str] | None = None,
+    allow_ip_literals: bool = False,
+) -> ProxyConfig:
+    """Load secret configuration from a JSON file.
+
+    Config format:
+    {
+        "OPENAI_API_KEY": {
+            "value": "sk-real-key",
+            "hosts": ["api.openai.com"]
+        }
+    }
+
+    Placeholders are auto-generated at load time.
+    """
+    path = Path(config_path)
+    with open(path) as f:
+        raw = json.load(f)
+
+    return _build_config_from_dict(raw, allow_net=allow_net, allow_ip_literals=allow_ip_literals)
+
+
+def load_config_from_dict(
+    raw: dict,
+    allow_net: list[str] | None = None,
+    allow_ip_literals: bool = False,
+) -> ProxyConfig:
+    """Build a ProxyConfig from an already-parsed dict.
+
+    Same validation as load_config() but skips file I/O.
+    Useful for loading config from environment variables or other non-file sources.
+
+    The dict format matches the JSON file format:
+    {
+        "SECRET_NAME": {
+            "value": "real-value",
+            "hosts": ["api.example.com"],
+            "placeholder": "optional-pre-assigned-placeholder"
+        }
+    }
+    """
+    return _build_config_from_dict(raw, allow_net=allow_net, allow_ip_literals=allow_ip_literals)
