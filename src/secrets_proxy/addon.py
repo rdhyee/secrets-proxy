@@ -302,6 +302,8 @@ class SecretsProxyAddon:
                         host, flow.request.path,
                     )
 
+        setattr(flow, "_secrets_proxy_request_had_substitutions", total_subs > 0)
+
         if total_subs > 0:
             self._stats["substituted"] += 1
             logger.info(
@@ -374,6 +376,36 @@ class SecretsProxyAddon:
             # Decompress if needed
             encoding_tokens = [t.strip() for t in content_encoding.split(",")]
             active_encodings = [t for t in encoding_tokens if t and t != "identity"]
+
+            # If Brotli is present but unavailable, fail closed when secrets
+            # were injected into the request (reflection risk). We cannot inspect
+            # compressed bytes for secret values, so we must assume the worst.
+            if "br" in active_encodings and not _HAS_BROTLI:
+                had_substitutions = getattr(
+                    flow, "_secrets_proxy_request_had_substitutions", False
+                )
+
+                if had_substitutions:
+                    logger.error(
+                        "audit action=block_response host=%s path=%s status=502 "
+                        "reason=brotli_unavailable_scrub_required",
+                        flow.request.pretty_host,
+                        flow.request.path,
+                    )
+                    flow.response = http.Response.make(
+                        502,
+                        b"secrets-proxy: blocked Brotli response because scrubbing is unavailable",
+                        {"Content-Type": "text/plain"},
+                    )
+                    return
+
+                logger.warning(
+                    "audit action=pass_response host=%s path=%s "
+                    "reason=brotli_unavailable_no_scrub_needed",
+                    flow.request.pretty_host,
+                    flow.request.path,
+                )
+                return
 
             for enc in reversed(active_encodings):
                 decompressed = self._try_decompress(body_bytes, enc)

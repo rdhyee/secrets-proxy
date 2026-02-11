@@ -153,10 +153,10 @@ class TestResponseScrubbing:
         # No redaction markers since no real secret value present
         assert "[REDACTED:" not in result
 
-    def test_brotli_decode_unavailable_logs_and_passes_through(
+    def test_brotli_response_with_scrub_needed_is_blocked(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
-        """When brotli decoding is unavailable, response is left unchanged."""
+        """Fail closed when Brotli is unavailable and response needs scrubbing."""
         monkeypatch.setattr("secrets_proxy.addon._HAS_BROTLI", False)
         monkeypatch.setattr("secrets_proxy.addon._brotli", None)
 
@@ -168,15 +168,81 @@ class TestResponseScrubbing:
             "Content-Length": str(len(original.encode("utf-8"))),
         }
         flow = _make_flow(response_body=original, response_headers=headers)
+        flow._secrets_proxy_request_had_substitutions = True
+
+        with caplog.at_level(logging.WARNING):
+            addon.response(flow)
+
+        assert flow.response.status_code == 502
+        assert b"blocked Brotli response" in flow.response.content
+        assert any(
+            "audit action=block_response" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_brotli_response_without_scrub_needed_passes_through(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """Pass through when Brotli is unavailable but no scrubbing is needed."""
+        monkeypatch.setattr("secrets_proxy.addon._HAS_BROTLI", False)
+        monkeypatch.setattr("secrets_proxy.addon._brotli", None)
+
+        config = _make_config()
+        addon = SecretsProxyAddon(config)
+        original = '{"message": "no secrets here"}'
+        headers = {
+            "Content-Encoding": "br",
+            "Content-Length": str(len(original.encode("utf-8"))),
+        }
+        flow = _make_flow(response_body=original, response_headers=headers)
+        flow._secrets_proxy_request_had_substitutions = False
 
         with caplog.at_level(logging.WARNING):
             addon.response(flow)
 
         assert flow.response.content == original.encode("utf-8")
         assert any(
-            "audit action=skip_response_scrub" in rec.message and "encoding=br" in rec.message
+            "audit action=pass_response" in rec.message
+            and "reason=brotli_unavailable_no_scrub_needed" in rec.message
             for rec in caplog.records
         )
+
+    def test_brotli_response_with_brotli_available_scrubs_normally(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """With Brotli available, decode/scrub/re-encode should work."""
+
+        class _FakeBrotli:
+            @staticmethod
+            def compress(data: bytes) -> bytes:
+                return b"BR:" + data
+
+            @staticmethod
+            def decompress(data: bytes) -> bytes:
+                assert data.startswith(b"BR:")
+                return data[3:]
+
+        monkeypatch.setattr("secrets_proxy.addon._HAS_BROTLI", True)
+        monkeypatch.setattr("secrets_proxy.addon._brotli", _FakeBrotli)
+
+        config = _make_config()
+        addon = SecretsProxyAddon(config)
+        original = "Bearer sk-real-key-12345"
+        compressed = _FakeBrotli.compress(original.encode("utf-8"))
+        headers = {
+            "Content-Encoding": "br",
+            "Content-Length": str(len(compressed)),
+        }
+        flow = _make_flow(response_body="", response_headers=headers)
+        flow.response.content = compressed
+
+        addon.response(flow)
+
+        assert flow.response.headers["Content-Encoding"] == "br"
+        decoded = _FakeBrotli.decompress(flow.response.content).decode("utf-8")
+        assert "sk-real-key-12345" not in decoded
+        assert "[REDACTED:OPENAI_API_KEY]" in decoded
+        assert flow.response.headers["Content-Length"] == str(len(flow.response.content))
 
 
 class TestRedactSecretsInText:
