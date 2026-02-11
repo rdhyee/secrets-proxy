@@ -169,6 +169,7 @@ class ProxyConfig:
         return json.dumps({
             "secrets": secrets_data,
             "allowed_hosts": sorted(self.allowed_hosts),
+            "allow_ip_literals": self.allow_ip_literals,
         })
 
     def find_secret_for_placeholder(

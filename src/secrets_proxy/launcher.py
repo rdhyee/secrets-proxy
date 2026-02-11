@@ -547,6 +547,3 @@ def run(
         _cleanup()
 
 
-def _get_addon_entry_path() -> str:
-    """Return the path to the production addon_entry.py module."""
-    return _ADDON_ENTRY_PATH

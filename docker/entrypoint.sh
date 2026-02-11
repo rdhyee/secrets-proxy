@@ -34,7 +34,7 @@ echo "[secrets-proxy] Starting (proxy_port=$PROXY_PORT, sandbox_uid=$SANDBOX_UID
 
 # ── Generate config + addon via secrets_proxy init ────────────
 
-SECRETS_PROXY_CONFIG_JSON=$(echo "$SECRETS_PROXY_CONFIG_JSON" | \
+SECRETS_PROXY_CONFIG_JSON=$(printf '%s' "$SECRETS_PROXY_CONFIG_JSON" | \
     python3 -m secrets_proxy init --sandbox-env /tmp/sandbox_env.sh)
 export SECRETS_PROXY_CONFIG_JSON
 

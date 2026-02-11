@@ -35,7 +35,7 @@ fi
 
 # ── Generate config + addon via secrets_proxy init ────────────
 
-SECRETS_PROXY_CONFIG_JSON=$(echo "$CONFIG_JSON" | \
+SECRETS_PROXY_CONFIG_JSON=$(printf '%s' "$CONFIG_JSON" | \
     $PYTHON3 -m secrets_proxy init --sandbox-env /tmp/sandbox_env.sh)
 export SECRETS_PROXY_CONFIG_JSON
 

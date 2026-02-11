@@ -41,7 +41,7 @@ def _load_config_from_env() -> ProxyConfig:
     raw_json = os.environ.pop("SECRETS_PROXY_CONFIG_JSON")
     data = json.loads(raw_json)
 
-    config = ProxyConfig()
+    config = ProxyConfig(allow_ip_literals=data.get("allow_ip_literals", False))
     secrets_data = data.get("secrets", {})
     for placeholder, info in secrets_data.items():
         entry = SecretEntry(

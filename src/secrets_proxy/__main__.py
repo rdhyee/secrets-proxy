@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shlex
 import sys
 from pathlib import Path
 
@@ -35,11 +36,11 @@ def _handle_init(args: argparse.Namespace) -> int:
 
     config = load_config_from_dict(raw)
 
-    # Write sandbox env file (export NAME="PLACEHOLDER")
+    # Write sandbox env file (export NAME=<shell-escaped placeholder>)
     if args.sandbox_env:
         with open(args.sandbox_env, "w") as f:
             for entry in config.secrets.values():
-                f.write(f'export {entry.name}="{entry.placeholder}"\n')
+                f.write(f'export {entry.name}={shlex.quote(entry.placeholder)}\n')
 
     # Print config JSON to stdout for shell capture
     print(config.to_env_json())

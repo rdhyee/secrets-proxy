@@ -52,6 +52,16 @@ class TestToEnvJson:
         names = {s["name"] for s in data["secrets"].values()}
         assert names == {"KEY_A", "KEY_B"}
 
+    def test_allow_ip_literals_preserved(self):
+        raw = {"KEY": {"value": "v", "hosts": ["1.2.3.4"]}}
+        config = load_config_from_dict(raw, allow_ip_literals=True)
+        data = json.loads(config.to_env_json())
+        assert data["allow_ip_literals"] is True
+
+        config2 = load_config_from_dict(raw, allow_ip_literals=False)
+        data2 = json.loads(config2.to_env_json())
+        assert data2["allow_ip_literals"] is False
+
     def test_allowed_hosts_sorted(self):
         raw = {
             "Z": {"value": "v", "hosts": ["z.com"]},
@@ -161,6 +171,14 @@ class TestAddonEntryLoadConfig:
         loaded = self._fresh_load(monkeypatch, env_json)
         assert loaded.secrets["KEY"].placeholder == original_placeholder
 
+    def test_allow_ip_literals_roundtrip(self, monkeypatch):
+        raw = {"KEY": {"value": "v", "hosts": ["1.2.3.4"]}}
+        config = load_config_from_dict(raw, allow_ip_literals=True)
+        env_json = config.to_env_json()
+
+        loaded = self._fresh_load(monkeypatch, env_json)
+        assert loaded.allow_ip_literals is True
+
     def test_missing_env_var_raises(self, monkeypatch):
         import sys
         import importlib
@@ -199,3 +217,34 @@ class TestAddonEntryScriptMode:
         assert "addons" in ns
         assert len(ns["addons"]) == 1
         assert "SECRETS_PROXY_CONFIG_JSON" not in os.environ
+
+
+class TestInitSandboxEnvSafety:
+    """Test that init subcommand writes shell-safe sandbox env files."""
+
+    def test_placeholder_with_shell_metacharacters_is_escaped(self, tmp_path):
+        """Placeholders containing $, ", backticks must be shell-escaped."""
+        import subprocess
+
+        raw = {
+            "KEY": {
+                "value": "v",
+                "hosts": ["a.com"],
+                "placeholder": '$(touch /tmp/pwned)',
+            }
+        }
+        env_file = tmp_path / "sandbox_env.sh"
+
+        from secrets_proxy.__main__ import main
+        main(["init", "--config-json", json.dumps(raw), "--sandbox-env", str(env_file)])
+
+        content = env_file.read_text()
+        # shlex.quote wraps in single quotes, so the $() is not interpreted
+        assert "'$(touch /tmp/pwned)'" in content
+
+        # Sourcing should set the variable literally, not execute the command
+        result = subprocess.run(
+            ["bash", "-c", f'source {env_file} && printf "%s" "$KEY"'],
+            capture_output=True, text=True,
+        )
+        assert result.stdout == "$(touch /tmp/pwned)"
