@@ -228,11 +228,34 @@ def load_config(
         validate_secret_name(name)
 
         if isinstance(entry_data, str):
-            # Simple format: {"OPENAI_API_KEY": "sk-real-key"}
-            # No host restriction, no injection config
             raise ValueError(
                 f"Secret '{name}' must be a dict with 'value' and 'hosts' keys, "
                 f"not a plain string. Secrets without host restrictions are not allowed."
+            )
+
+        if not isinstance(entry_data, dict):
+            raise TypeError(
+                f"Secret '{name}': expected a dict, got {type(entry_data).__name__}"
+            )
+
+        # Validate required keys with clear messages
+        if "value" not in entry_data:
+            raise ValueError(
+                f"Secret '{name}' is missing required key 'value'."
+            )
+        if "hosts" not in entry_data:
+            raise ValueError(
+                f"Secret '{name}' is missing required key 'hosts'. "
+                f"Every secret must be scoped to specific destination hosts."
+            )
+        if not isinstance(entry_data["hosts"], list):
+            raise TypeError(
+                f"Secret '{name}': 'hosts' must be a list of hostnames, "
+                f"got {type(entry_data['hosts']).__name__}"
+            )
+        if not entry_data["hosts"]:
+            raise ValueError(
+                f"Secret '{name}': 'hosts' list cannot be empty."
             )
 
         inject = entry_data.get("inject", {})

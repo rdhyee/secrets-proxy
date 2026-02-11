@@ -5,10 +5,13 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -21,10 +24,39 @@ PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 8080
 
 
+def _check_mitmdump() -> None:
+    """Verify that mitmdump is available on PATH.
+
+    Raises RuntimeError with a clear message if not found.
+    """
+    if shutil.which("mitmdump") is None:
+        raise RuntimeError(
+            "mitmdump not found on PATH. Install mitmproxy: "
+            "pip install mitmproxy  or  brew install mitmproxy"
+        )
+
+
+def _check_config_permissions(config_path: str | Path) -> None:
+    """Warn if the secrets config file has overly permissive permissions."""
+    try:
+        st = os.stat(config_path)
+        mode = st.st_mode
+        if mode & (stat.S_IRGRP | stat.S_IROTH):
+            logger.warning(
+                "Config file %s is readable by group/others (mode %o). "
+                "Consider: chmod 600 %s",
+                config_path, stat.S_IMODE(mode), config_path,
+            )
+    except OSError:
+        pass  # File might not exist yet or be unstat-able
+
+
 def _generate_mitmproxy_ca_if_needed() -> None:
     """Run mitmproxy briefly to generate CA certs if they don't exist."""
     if MITMPROXY_CA_CERT.exists():
         return
+
+    _check_mitmdump()
 
     logger.info("Generating mitmproxy CA certificate (first run)...")
     MITMPROXY_CA_DIR.mkdir(parents=True, exist_ok=True)
@@ -98,7 +130,13 @@ def _teardown_nftables(sandbox_uid: int, proxy_port: int) -> None:
 
 
 def start_proxy(config: ProxyConfig, addon_path: str) -> subprocess.Popen:
-    """Start mitmproxy in transparent mode with the secrets addon."""
+    """Start mitmproxy with the secrets addon.
+
+    Uses subprocess.DEVNULL for stdout/stderr to avoid pipe deadlock
+    (mitmproxy can produce enough output to fill pipe buffers).
+    """
+    _check_mitmdump()
+
     cmd = [
         "mitmdump",
         "--mode", "regular",
@@ -112,15 +150,17 @@ def start_proxy(config: ProxyConfig, addon_path: str) -> subprocess.Popen:
     logger.info("Starting mitmproxy: %s", " ".join(cmd))
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
     # Wait for proxy to be ready
     time.sleep(1)
     if proc.poll() is not None:
-        stderr = proc.stderr.read().decode() if proc.stderr else ""
-        raise RuntimeError(f"mitmproxy failed to start: {stderr}")
+        raise RuntimeError(
+            f"mitmproxy exited immediately (code {proc.returncode}). "
+            "Check that the port is available and the addon script is valid."
+        )
 
     logger.info("mitmproxy started (PID %d) on %s:%d", proc.pid, PROXY_HOST, config.proxy_port or PROXY_PORT)
     return proc
@@ -159,6 +199,22 @@ def run(
     # Step 4: Start mitmproxy
     proxy_proc = start_proxy(config, addon_script)
 
+    # Sandbox process reference for health monitor
+    sandbox_proc: subprocess.Popen | None = None
+
+    def _proxy_health_monitor() -> None:
+        """Background thread: kill sandbox if proxy dies unexpectedly."""
+        while True:
+            time.sleep(1)
+            if proxy_proc.poll() is not None:
+                logger.error(
+                    "mitmproxy died (exit %d) — killing sandbox for fail-closed safety",
+                    proxy_proc.returncode,
+                )
+                if sandbox_proc and sandbox_proc.poll() is None:
+                    sandbox_proc.kill()
+                return
+
     try:
         # Step 5: Build environment for sandboxed process
         sandbox_env = os.environ.copy()
@@ -180,15 +236,26 @@ def run(
         uid = os.getuid()
         used_nftables = _setup_nftables(uid, port)
 
-        # Step 6: Run the sandboxed command
+        # Step 6: Start health monitor and run the sandboxed command
+        monitor = threading.Thread(target=_proxy_health_monitor, daemon=True)
+        monitor.start()
+
         logger.info("Running: %s", " ".join(command))
         try:
-            result = subprocess.run(command, env=sandbox_env)
-            return result.returncode
+            sandbox_proc = subprocess.Popen(command, env=sandbox_env)
+            sandbox_proc.wait()
+            return sandbox_proc.returncode
         finally:
-            # Step 7: Clean up
+            # Step 7: Clean up nftables
             if used_nftables:
                 _teardown_nftables(uid, port)
+            # Ensure sandbox is stopped
+            if sandbox_proc and sandbox_proc.poll() is None:
+                sandbox_proc.terminate()
+                try:
+                    sandbox_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    sandbox_proc.kill()
 
     finally:
         # Stop mitmproxy
