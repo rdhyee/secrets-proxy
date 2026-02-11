@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from secrets_proxy import addon as addon_module
 from secrets_proxy.addon import SecretsProxyAddon
 from secrets_proxy.config import ProxyConfig, SecretEntry
 
@@ -144,7 +145,7 @@ def test_try_decompress_normal_gzip_works() -> None:
 def test_try_decompress_oversize_returns_none_and_logs_warning(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    monkeypatch.setattr("secrets_proxy.addon.MAX_DECOMPRESS_SIZE", 16)
+    monkeypatch.setattr(addon_module, "MAX_DECOMPRESS_SIZE", 16)
     config = _make_config()
     addon = SecretsProxyAddon(config)
     compressed = gzip.compress(b"a" * 17)
