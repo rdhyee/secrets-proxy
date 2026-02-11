@@ -71,7 +71,7 @@ def _validate_host_pattern(pattern: str) -> None:
             )
         # Validate the domain part after *.
         domain_part = pattern[2:]
-        if not domain_part or ".." in domain_part:
+        if not domain_part or ".." in domain_part or domain_part.startswith("."):
             raise ValueError(
                 f"Invalid wildcard pattern '{pattern}': domain part is invalid."
             )
