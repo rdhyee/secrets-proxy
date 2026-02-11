@@ -256,6 +256,105 @@ class SecretsProxyAddon:
                 host, flow.request.path, flow.request.method,
             )
 
+    def _redact_secrets_in_text(self, text: str) -> tuple[str, int]:
+        """Replace real secret values with redaction markers in response text.
+
+        This prevents reflection attacks where an approved host echoes
+        back injected secrets in its response (e.g., debug/echo endpoints).
+
+        Returns the redacted text and the number of redactions made.
+        """
+        count = 0
+        for _name, entry in self.config.secrets.items():
+            if entry.value in text:
+                text = text.replace(entry.value, f"[REDACTED:{entry.name}]")
+                count += 1
+                logger.warning(
+                    "audit action=redact_response secret=%s reason=reflection_prevention",
+                    entry.name,
+                )
+        return text, count
+
+    def response(self, flow: http.HTTPFlow) -> None:
+        """Scrub real secret values from responses to prevent reflection attacks.
+
+        If an approved host echoes back request headers or body (e.g., a debug
+        endpoint like httpbin.org/headers), the real secret injected by the
+        request hook would be visible to the sandbox. This hook redacts them.
+        """
+        if flow.response is None:
+            return
+
+        total_redactions = 0
+
+        # Scrub response headers
+        for header_name in list(flow.response.headers.keys()):
+            header_value = flow.response.headers[header_name]
+            new_value, redactions = self._redact_secrets_in_text(header_value)
+            if redactions > 0:
+                flow.response.headers[header_name] = new_value
+                total_redactions += redactions
+
+        # Scrub response body
+        if flow.response.content:
+            content_encoding = flow.response.headers.get(
+                "Content-Encoding", ""
+            ).lower().strip()
+            body_bytes = flow.response.content
+            was_compressed = False
+
+            # Decompress if needed
+            encoding_tokens = [t.strip() for t in content_encoding.split(",")]
+            active_encodings = [t for t in encoding_tokens if t and t != "identity"]
+
+            for enc in reversed(active_encodings):
+                decompressed = self._try_decompress(body_bytes, enc)
+                if decompressed is not None:
+                    body_bytes = decompressed
+                    was_compressed = True
+                else:
+                    body_bytes = None
+                    break
+
+            if body_bytes is not None:
+                try:
+                    body_text = body_bytes.decode("utf-8")
+                    new_body, redactions = self._redact_secrets_in_text(body_text)
+                    if redactions > 0:
+                        new_body_bytes = new_body.encode("utf-8")
+                        if was_compressed:
+                            recompressed = new_body_bytes
+                            compress_ok = True
+                            for enc in active_encodings:
+                                result = self._try_compress(recompressed, enc)
+                                if result is not None:
+                                    recompressed = result
+                                else:
+                                    compress_ok = False
+                                    break
+                            if compress_ok:
+                                flow.response.content = recompressed
+                            else:
+                                flow.response.content = new_body_bytes
+                                if "Content-Encoding" in flow.response.headers:
+                                    del flow.response.headers["Content-Encoding"]
+                        else:
+                            flow.response.content = new_body_bytes
+
+                        if "Content-Length" in flow.response.headers:
+                            flow.response.headers["Content-Length"] = str(
+                                len(flow.response.content)
+                            )
+                        total_redactions += redactions
+                except UnicodeDecodeError:
+                    pass
+
+        if total_redactions > 0:
+            logger.warning(
+                "audit action=redact_response host=%s path=%s redactions=%d",
+                flow.request.pretty_host, flow.request.path, total_redactions,
+            )
+
     @property
     def stats(self) -> dict[str, int]:
         return dict(self._stats)

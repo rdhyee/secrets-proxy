@@ -112,6 +112,34 @@ def request(flow):
             flow.request.content = body.encode()
         except:
             pass
+
+def _redact_secret_values(text):
+    count = 0
+    for placeholder, info in SECRETS.items():
+        if info[\"value\"] in text:
+            text = text.replace(info[\"value\"], \"[REDACTED:\" + info[\"name\"] + \"]\")
+            count += 1
+            logger.warning(\"Redacted %s from response (reflection prevention)\", info[\"name\"])
+    return text, count
+
+def response(flow):
+    if flow.response is None:
+        return
+    for hname in list(flow.response.headers.keys()):
+        hval = flow.response.headers[hname]
+        new_val, n = _redact_secret_values(hval)
+        if n > 0:
+            flow.response.headers[hname] = new_val
+    if flow.response.content:
+        try:
+            body = flow.response.content.decode()
+            new_body, n = _redact_secret_values(body)
+            if n > 0:
+                flow.response.content = new_body.encode()
+                if \"Content-Length\" in flow.response.headers:
+                    flow.response.headers[\"Content-Length\"] = str(len(flow.response.content))
+        except:
+            pass
 '''
 print(addon)
 " "$CONFIG_JSON" > "$ADDON_SCRIPT"
@@ -182,25 +210,24 @@ fi
 echo "[secrets-proxy] mitmproxy started (PID $PROXY_PID)"
 
 # ── nftables setup (the "concrete walls") ──────────────────────
+# Uses inet family to cover both IPv4 and IPv6.
 
-# Create tables first (may not exist on fresh Sprite)
-nft add table ip nat 2>/dev/null || true
-nft add table ip filter 2>/dev/null || true
+nft add table inet "$NFT_CHAIN"
 
-# NAT chain — redirect sandbox traffic
-nft add chain ip nat "$NFT_CHAIN" '{ type nat hook output priority -1 ; }'
-nft add rule ip nat "$NFT_CHAIN" meta mark 0x$PROXY_MARK accept
-nft add rule ip nat "$NFT_CHAIN" meta skuid "$SANDBOX_UID" ip daddr 127.0.0.1 tcp dport "$PROXY_PORT" accept
-nft add rule ip nat "$NFT_CHAIN" meta skuid "$SANDBOX_UID" ip protocol tcp redirect to :"$PROXY_PORT"
+# NAT chain — redirect sandbox IPv4 TCP traffic
+nft add chain inet "$NFT_CHAIN" nat_output '{ type nat hook output priority -1 ; }'
+nft add rule inet "$NFT_CHAIN" nat_output meta mark 0x$PROXY_MARK accept
+nft add rule inet "$NFT_CHAIN" nat_output meta skuid "$SANDBOX_UID" ip daddr 127.0.0.1 tcp dport "$PROXY_PORT" accept
+nft add rule inet "$NFT_CHAIN" nat_output meta skuid "$SANDBOX_UID" meta nfproto ipv4 meta l4proto tcp redirect to :"$PROXY_PORT"
 
-# Filter chain — block UDP except DNS
-nft add chain ip filter "${NFT_CHAIN}_filter" '{ type filter hook output priority 0 ; }'
-nft add rule ip filter "${NFT_CHAIN}_filter" meta skuid "$SANDBOX_UID" udp dport 53 accept
-nft add rule ip filter "${NFT_CHAIN}_filter" meta skuid "$SANDBOX_UID" ip protocol udp drop
+# Filter chain — block IPv6 TCP + all UDP except DNS
+nft add chain inet "$NFT_CHAIN" filter_output '{ type filter hook output priority 0 ; }'
+nft add rule inet "$NFT_CHAIN" filter_output meta skuid "$SANDBOX_UID" meta nfproto ipv6 meta l4proto tcp drop
+nft add rule inet "$NFT_CHAIN" filter_output meta skuid "$SANDBOX_UID" udp dport 53 accept
+nft add rule inet "$NFT_CHAIN" filter_output meta skuid "$SANDBOX_UID" meta l4proto udp drop
 
 echo "[secrets-proxy] nftables installed:"
-nft list chain ip nat "$NFT_CHAIN"
-nft list chain ip filter "${NFT_CHAIN}_filter"
+nft list table inet "$NFT_CHAIN"
 
 # ── Cleanup handler ────────────────────────────────────────────
 
@@ -208,8 +235,7 @@ cleanup() {
     echo "[secrets-proxy] Cleaning up..."
     kill $PROXY_PID 2>/dev/null || true
     wait $PROXY_PID 2>/dev/null || true
-    nft delete chain ip nat "$NFT_CHAIN" 2>/dev/null || true
-    nft delete chain ip filter "${NFT_CHAIN}_filter" 2>/dev/null || true
+    nft delete table inet "$NFT_CHAIN" 2>/dev/null || true
     rm -f "$ADDON_SCRIPT" "$CA_BUNDLE" /tmp/sandbox_env.sh
     echo "[secrets-proxy] Done"
 }

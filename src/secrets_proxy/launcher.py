@@ -106,8 +106,8 @@ def _generate_mitmproxy_ca_if_needed() -> None:
 def _setup_nftables(sandbox_uid: int, proxy_port: int) -> bool:
     """Set up nftables to redirect **all** sandbox TCP through the proxy.
 
-    Creates a dedicated chain ``secrets_proxy`` in the ``ip nat`` table so that
-    teardown only removes our rules (not anyone else's).
+    Creates dedicated chains in the ``inet`` family (covers both IPv4 and
+    IPv6) so that teardown only removes our rules (not anyone else's).
 
     The rules implement a default-deny egress policy for the sandbox UID:
 
@@ -115,8 +115,9 @@ def _setup_nftables(sandbox_uid: int, proxy_port: int) -> bool:
        upstream connections -- without this exemption the proxy's traffic would
        loop back to itself).
     2. Allow traffic to the proxy listener only (127.0.0.1:proxy_port).
-    3. Redirect **all** remaining TCP from ``sandbox_uid`` to ``proxy_port``.
-    4. Drop **all** UDP from ``sandbox_uid`` except DNS (port 53).
+    3. Redirect **all** remaining IPv4 TCP from ``sandbox_uid`` to ``proxy_port``.
+    4. Drop **all** IPv6 TCP from ``sandbox_uid`` (proxy listens on IPv4 only).
+    5. Drop **all** UDP from ``sandbox_uid`` except DNS (port 53).
 
     Returns True if nftables was set up, False if not available.
     Only works on Linux with root/CAP_NET_ADMIN.
@@ -130,44 +131,58 @@ def _setup_nftables(sandbox_uid: int, proxy_port: int) -> bool:
 
     try:
         cmds = [
-            # --- Create dedicated NAT chain ---
-            ["nft", "add", "chain", "ip", "nat", _NFT_CHAIN,
+            # --- Create inet tables (covers both IPv4 and IPv6) ---
+            ["nft", "add", "table", "inet", _NFT_CHAIN],
+
+            # --- NAT chain (IPv4 redirect) ---
+            # Note: redirect target in inet NAT chains applies to IPv4 traffic.
+            # IPv6 TCP is handled by the filter chain (dropped).
+            ["nft", "add", "chain", "inet", _NFT_CHAIN, "nat_output",
              "{ type nat hook output priority -1 ; }"],
 
             # 1. Skip marked packets (proxy's own upstream traffic)
-            ["nft", "add", "rule", "ip", "nat", _NFT_CHAIN,
+            ["nft", "add", "rule", "inet", _NFT_CHAIN, "nat_output",
              "meta", "mark", hex(_PROXY_MARK), "accept"],
 
             # 2. Allow sandbox -> proxy listener ONLY (not all of localhost)
-            ["nft", "add", "rule", "ip", "nat", _NFT_CHAIN,
+            ["nft", "add", "rule", "inet", _NFT_CHAIN, "nat_output",
              "meta", "skuid", str(sandbox_uid),
              "ip", "daddr", "127.0.0.1", "tcp", "dport", str(proxy_port), "accept"],
 
-            # 3. Redirect all remaining TCP from sandbox UID to proxy port
-            ["nft", "add", "rule", "ip", "nat", _NFT_CHAIN,
+            # 3. Redirect all remaining IPv4 TCP from sandbox UID to proxy port
+            ["nft", "add", "rule", "inet", _NFT_CHAIN, "nat_output",
              "meta", "skuid", str(sandbox_uid),
-             "ip", "protocol", "tcp",
+             "meta", "nfproto", "ipv4",
+             "meta", "l4proto", "tcp",
              "redirect", "to", f":{proxy_port}"],
 
-            # --- Block UDP egress for sandbox UID (separate filter chain) ---
-            ["nft", "add", "chain", "ip", "filter", f"{_NFT_CHAIN}_filter",
+            # --- Filter chain (blocks IPv6 TCP + all UDP except DNS) ---
+            ["nft", "add", "chain", "inet", _NFT_CHAIN, "filter_output",
              "{ type filter hook output priority 0 ; }"],
 
-            # 4a. Allow DNS (UDP port 53) so name resolution works
-            ["nft", "add", "rule", "ip", "filter", f"{_NFT_CHAIN}_filter",
+            # 4. Drop ALL IPv6 TCP from sandbox (proxy only listens on IPv4)
+            ["nft", "add", "rule", "inet", _NFT_CHAIN, "filter_output",
+             "meta", "skuid", str(sandbox_uid),
+             "meta", "nfproto", "ipv6",
+             "meta", "l4proto", "tcp",
+             "drop"],
+
+            # 5a. Allow DNS (UDP port 53) so name resolution works
+            ["nft", "add", "rule", "inet", _NFT_CHAIN, "filter_output",
              "meta", "skuid", str(sandbox_uid),
              "udp", "dport", "53", "accept"],
 
-            # 4b. Drop all other UDP from sandbox UID (QUIC bypass prevention)
-            ["nft", "add", "rule", "ip", "filter", f"{_NFT_CHAIN}_filter",
+            # 5b. Drop all other UDP from sandbox UID (QUIC bypass prevention)
+            ["nft", "add", "rule", "inet", _NFT_CHAIN, "filter_output",
              "meta", "skuid", str(sandbox_uid),
-             "ip", "protocol", "udp",
+             "meta", "l4proto", "udp",
              "drop"],
         ]
         for cmd in cmds:
             subprocess.run(cmd, check=True, capture_output=True)
         logger.info(
-            "nftables rules set for UID %d -> port %d (mark 0x%x exempt, UDP blocked except DNS)",
+            "nftables rules set for UID %d -> port %d (mark 0x%x exempt, "
+            "IPv6 TCP blocked, UDP blocked except DNS)",
             sandbox_uid, proxy_port, _PROXY_MARK,
         )
         return True
@@ -177,25 +192,20 @@ def _setup_nftables(sandbox_uid: int, proxy_port: int) -> bool:
 
 
 def _teardown_nftables(sandbox_uid: int, proxy_port: int) -> None:
-    """Remove only the nftables chains created by secrets-proxy. Best-effort.
+    """Remove only the nftables table created by secrets-proxy. Best-effort.
 
-    Flushes and deletes the dedicated ``secrets_proxy`` and
-    ``secrets_proxy_filter`` chains without touching any other rules.
+    Deletes the dedicated ``inet secrets_proxy`` table (which contains both
+    the NAT and filter chains) without touching any other rules.
     """
     if platform.system() != "Linux":
         return
-    for table, chain in [("nat", _NFT_CHAIN), ("filter", f"{_NFT_CHAIN}_filter")]:
-        try:
-            subprocess.run(
-                ["nft", "flush", "chain", "ip", table, chain],
-                capture_output=True,
-            )
-            subprocess.run(
-                ["nft", "delete", "chain", "ip", table, chain],
-                capture_output=True,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
+    try:
+        subprocess.run(
+            ["nft", "delete", "table", "inet", _NFT_CHAIN],
+            capture_output=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
     logger.info("nftables rules cleaned up")
 
 
@@ -508,6 +518,49 @@ def request(flow: http.HTTPFlow) -> None:
         logger.info("audit action=substitute host=%s path=%s secrets_injected=%d method=%s", host, flow.request.path, total_subs, flow.request.method)
     else:
         logger.debug("audit action=pass host=%s path=%s method=%s", host, flow.request.path, flow.request.method)
+
+
+def _redact_secret_values(text: str) -> tuple[str, int]:
+    """Replace real secret values with redaction markers."""
+    count = 0
+    for placeholder, info in SECRETS.items():
+        if info["value"] in text:
+            text = text.replace(info["value"], f"[REDACTED:{info['name']}]")
+            count += 1
+            logger.warning("audit action=redact_response secret=%s reason=reflection_prevention", info["name"])
+    return text, count
+
+
+def response(flow: http.HTTPFlow) -> None:
+    """Scrub real secret values from responses to prevent reflection attacks."""
+    if flow.response is None:
+        return
+
+    total_redactions = 0
+
+    # Scrub response headers
+    for hname in list(flow.response.headers.keys()):
+        hval = flow.response.headers[hname]
+        new_val, n = _redact_secret_values(hval)
+        if n > 0:
+            flow.response.headers[hname] = new_val
+            total_redactions += n
+
+    # Scrub response body
+    if flow.response.content:
+        try:
+            body = flow.response.content.decode("utf-8")
+            new_body, n = _redact_secret_values(body)
+            if n > 0:
+                flow.response.content = new_body.encode("utf-8")
+                if "Content-Length" in flow.response.headers:
+                    flow.response.headers["Content-Length"] = str(len(flow.response.content))
+                total_redactions += n
+        except UnicodeDecodeError:
+            pass
+
+    if total_redactions > 0:
+        logger.warning("audit action=redact_response host=%s path=%s redactions=%d", flow.request.pretty_host, flow.request.path, total_redactions)
 '''
 
     fd, path = tempfile.mkstemp(suffix=".py", prefix="secrets_proxy_addon_")

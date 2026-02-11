@@ -140,6 +140,24 @@ def test_raw_socket():
         return True
 
 
+def test_ipv6_bypass():
+    """Try connecting via IPv6 — should be blocked by inet nftables rules."""
+    print("  Attempting IPv6 TCP connect...")
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(("2606:2800:21f:cb07:6820:80da:af6b:8b2c", 443))
+        s.close()
+        print("  FAIL: IPv6 connection succeeded — bypass possible!")
+        return False
+    except (ConnectionRefusedError, OSError, socket.timeout) as e:
+        print(f"  PASS: IPv6 blocked ({e})")
+        return True
+    except Exception as e:
+        print(f"  PASS: IPv6 failed ({type(e).__name__}: {e})")
+        return True
+
+
 tests = [
     ("Sandbox isolation", test_isolation),
     ("OpenAI API through proxy", test_openai_call),
@@ -150,6 +168,7 @@ tests = [
     ("Cannot sudo read proxy env", test_sudo_cat_environ),
     ("Cannot kill proxy", test_kill_proxy),
     ("Cannot create raw socket", test_raw_socket),
+    ("IPv6 bypass blocked", test_ipv6_bypass),
 ]
 
 results = [(name, run_test(name, fn)) for name, fn in tests]

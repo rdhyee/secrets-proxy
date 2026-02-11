@@ -234,6 +234,24 @@ def test_non_standard_port():
         return True
 
 
+def test_ipv6_bypass():
+    """Test 11: Try connecting via IPv6 (should be blocked by inet nftables rules)."""
+    print("  Attempting IPv6 TCP connect to [2606:2800:21f:cb07:6820:80da:af6b:8b2c]:443 (example.com)...")
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect(("2606:2800:21f:cb07:6820:80da:af6b:8b2c", 443))
+        sock.close()
+        print("  FAIL: IPv6 connection succeeded — bypass possible!")
+        return False
+    except (ConnectionRefusedError, OSError, socket.timeout) as e:
+        print(f"  PASS: IPv6 blocked ({e})")
+        return True
+    except Exception as e:
+        print(f"  PASS: IPv6 failed ({type(e).__name__}: {e})")
+        return True
+
+
 def main():
     tests = [
         ("Sandbox isolation (no real secret in env)", test_sandbox_isolation),
@@ -246,6 +264,7 @@ def main():
         ("Cannot read proxy environment", test_read_proxy_env),
         ("Cannot create raw socket", test_raw_socket),
         ("Non-standard port intercepted", test_non_standard_port),
+        ("IPv6 bypass blocked", test_ipv6_bypass),
     ]
 
     results = []
