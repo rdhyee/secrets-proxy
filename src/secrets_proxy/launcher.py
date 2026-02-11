@@ -153,11 +153,49 @@ def run(
     bundle_path, ca_env = setup_ca_trust(ca_bundle_path)
     logger.info("CA bundle created at %s", bundle_path)
 
-    # Step 3: Write addon script with embedded config
+    # Step 3: Write addon script (secrets passed via env var, not in file)
     addon_script = _create_addon_script(config)
 
     # Step 4: Start mitmproxy
     proxy_proc = start_proxy(config, addon_script)
+
+    # Track cleanup state for signal handlers
+    used_nftables = False
+    uid = os.getuid()
+
+    def _cleanup() -> None:
+        """Best-effort cleanup of all resources."""
+        # Stop mitmproxy
+        proxy_proc.terminate()
+        try:
+            proxy_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proxy_proc.kill()
+            proxy_proc.wait()
+        logger.info("mitmproxy stopped")
+
+        # Clean up nftables
+        if used_nftables:
+            _teardown_nftables(uid, port)
+
+        # Clean up temp files
+        for path in [addon_script, str(bundle_path)]:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        # Clear secrets from env
+        os.environ.pop("SECRETS_PROXY_CONFIG_JSON", None)
+
+    # Install signal handlers so cleanup runs on SIGTERM/SIGINT
+    def _signal_handler(signum: int, frame: object) -> None:
+        logger.info("Received signal %d, cleaning up...", signum)
+        _cleanup()
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
 
     try:
         # Step 5: Build environment for sandboxed process
@@ -169,6 +207,9 @@ def run(
         # CA trust env vars
         sandbox_env.update(ca_env)
 
+        # Remove the config JSON from child env (addon already read it)
+        sandbox_env.pop("SECRETS_PROXY_CONFIG_JSON", None)
+
         # Proxy env vars (for macOS / non-nftables mode)
         proxy_url = f"http://{PROXY_HOST}:{port}"
         sandbox_env["HTTP_PROXY"] = proxy_url
@@ -177,7 +218,6 @@ def run(
         sandbox_env["https_proxy"] = proxy_url
 
         # Try nftables (Linux strong mode)
-        uid = os.getuid()
         used_nftables = _setup_nftables(uid, port)
 
         # Step 6: Run the sandboxed command
@@ -191,29 +231,21 @@ def run(
                 _teardown_nftables(uid, port)
 
     finally:
-        # Stop mitmproxy
-        proxy_proc.terminate()
-        try:
-            proxy_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proxy_proc.kill()
-            proxy_proc.wait()
-        logger.info("mitmproxy stopped")
-
-        # Clean up addon script
-        try:
-            os.unlink(addon_script)
-        except OSError:
-            pass
+        _cleanup()
 
 
 def _create_addon_script(config: ProxyConfig) -> str:
-    """Create a temporary mitmproxy addon script with embedded config.
+    """Create a temporary mitmproxy addon script.
 
-    We serialize the config into the script so mitmproxy can load it
-    as a standalone addon without needing to import secrets_proxy.
+    Secrets are passed via the SECRETS_PROXY_CONFIG_JSON environment variable
+    (not embedded in the script file) so that real credentials are never
+    written to disk.
     """
-    # Serialize the minimal config needed by the addon
+    import json as _json
+
+    allowed_hosts = list(config.allowed_hosts)
+
+    # Build the secrets config to pass via env var
     secrets_data = {}
     for name, entry in config.secrets.items():
         secrets_data[entry.placeholder] = {
@@ -221,17 +253,29 @@ def _create_addon_script(config: ProxyConfig) -> str:
             "value": entry.value,
             "hosts": entry.hosts,
         }
+    # Store in env var for the addon to read at import time
+    os.environ["SECRETS_PROXY_CONFIG_JSON"] = _json.dumps({
+        "secrets": secrets_data,
+        "allowed_hosts": allowed_hosts,
+    })
 
-    allowed_hosts = list(config.allowed_hosts)
+    script_content = '''"""Auto-generated mitmproxy addon for secrets-proxy.
 
-    script_content = f'''"""Auto-generated mitmproxy addon for secrets-proxy."""
+Reads config from SECRETS_PROXY_CONFIG_JSON env var (secrets never touch disk).
+"""
+import json
 import logging
+import os
+
 from mitmproxy import http
 
 logger = logging.getLogger("secrets-proxy-addon")
 
-SECRETS = {secrets_data!r}
-ALLOWED_HOSTS = {allowed_hosts!r}
+_config = json.loads(os.environ["SECRETS_PROXY_CONFIG_JSON"])
+SECRETS = _config["secrets"]
+ALLOWED_HOSTS = _config["allowed_hosts"]
+# Clear from env immediately so child processes don't inherit it
+del os.environ["SECRETS_PROXY_CONFIG_JSON"]
 
 
 def _host_allowed(host: str) -> bool:
@@ -262,8 +306,8 @@ def request(flow: http.HTTPFlow) -> None:
     if not _host_allowed(host):
         flow.response = http.Response.make(
             403,
-            f"secrets-proxy: host '{{host}}' not in allowlist".encode(),
-            {{"Content-Type": "text/plain"}},
+            f"secrets-proxy: host '{host}' not in allowlist".encode(),
+            {"Content-Type": "text/plain"},
         )
         logger.info("Blocked: %s", host)
         return
@@ -298,10 +342,10 @@ def request(flow: http.HTTPFlow) -> None:
             if n > 0:
                 flow.request.content = new_body.encode("utf-8")
         except UnicodeDecodeError:
-            pass
+            logger.warning("Binary body to %s, skipping substitution", host)
 '''
 
-    # Write to temp file
+    # Write to temp file (no secrets in the script — they're in env var)
     fd, path = tempfile.mkstemp(suffix=".py", prefix="secrets_proxy_addon_")
     with os.fdopen(fd, "w") as f:
         f.write(script_content)

@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import os
-import shutil
+import tempfile
 from pathlib import Path
 
 # mitmproxy's default CA cert location
 MITMPROXY_CA_DIR = Path.home() / ".mitmproxy"
 MITMPROXY_CA_CERT = MITMPROXY_CA_DIR / "mitmproxy-ca-cert.pem"
 
-# Where we install the combined CA bundle
-PROXY_CA_DIR = Path("/etc/secrets-proxy")
-PROXY_CA_BUNDLE = PROXY_CA_DIR / "ca-bundle.pem"
+# Default CA bundle location — use a temp file so no root is needed.
+# The bundle is ephemeral and cleaned up when the proxy exits.
+_DEFAULT_CA_BUNDLE: Path | None = None
 
 # System CA bundle locations (Linux)
 SYSTEM_CA_BUNDLES = [
@@ -58,11 +57,17 @@ def create_combined_ca_bundle(output_path: Path | None = None) -> Path:
 
     This is the key to transparency — any language's TLS library that
     respects SSL_CERT_FILE will trust both real CAs and our proxy.
-    """
-    output = output_path or PROXY_CA_BUNDLE
 
-    # Ensure output directory exists
-    output.parent.mkdir(parents=True, exist_ok=True)
+    If no output_path is given, creates a temp file (no root needed).
+    """
+    if output_path is not None:
+        output = output_path
+        output.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        fd, tmp_path = tempfile.mkstemp(suffix=".pem", prefix="secrets_proxy_ca_")
+        import os
+        os.close(fd)
+        output = Path(tmp_path)
 
     mitm_ca = ensure_mitmproxy_ca()
     system_ca = find_system_ca_bundle()
@@ -71,12 +76,14 @@ def create_combined_ca_bundle(output_path: Path | None = None) -> Path:
         # Start with system CAs
         if system_ca:
             with open(system_ca) as f:
-                out.write(f.read())
-            if not out.tell() or not f.read().endswith("\n"):
+                content = f.read()
+            out.write(content)
+            # Ensure newline between system CAs and mitmproxy CA
+            if content and not content.endswith("\n"):
                 out.write("\n")
 
         # Append mitmproxy CA
-        out.write(f"# secrets-proxy MITM CA\n")
+        out.write("# secrets-proxy MITM CA\n")
         with open(mitm_ca) as f:
             out.write(f.read())
 
