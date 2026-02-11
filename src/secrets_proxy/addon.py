@@ -71,7 +71,12 @@ class SecretsProxyAddon:
                 {"Content-Type": "text/plain"},
             )
             self._stats["blocked"] += 1
-            logger.info("Blocked request to non-allowed host: %s", host)
+            logger.info(
+                "audit action=block host=%s path=%s method=%s",
+                host,
+                flow.request.path,
+                flow.request.method,
+            )
             return
 
         # 2. Substitute placeholders in request headers
@@ -99,18 +104,29 @@ class SecretsProxyAddon:
                     flow.request.content = new_body.encode("utf-8")
                     total_subs += subs
             except UnicodeDecodeError:
-                pass  # Binary body, skip substitution
+                logger.warning(
+                    "audit action=skip_body host=%s path=%s reason=binary_content",
+                    host,
+                    flow.request.path,
+                )
 
         if total_subs > 0:
             self._stats["substituted"] += 1
             logger.info(
-                "Substituted %d secret(s) in request to %s%s",
-                total_subs,
+                "audit action=substitute host=%s path=%s secrets_injected=%d method=%s",
                 host,
                 flow.request.path,
+                total_subs,
+                flow.request.method,
             )
         else:
             self._stats["passed"] += 1
+            logger.debug(
+                "audit action=pass host=%s path=%s method=%s",
+                host,
+                flow.request.path,
+                flow.request.method,
+            )
 
     @property
     def stats(self) -> dict[str, int]:

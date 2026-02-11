@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import json
-import os
 import re
 import secrets
 from dataclasses import dataclass, field
@@ -127,8 +125,6 @@ class SecretEntry:
     placeholder: str
     value: str
     hosts: list[str]
-    inject_header: str = "Authorization"
-    inject_format: str = "Bearer {value}"
 
     def matches_host(self, host: str) -> bool:
         """Check if a host is approved for this secret.
@@ -207,15 +203,10 @@ def load_config(
     {
         "OPENAI_API_KEY": {
             "value": "sk-real-key",
-            "hosts": ["api.openai.com"],
-            "inject": {
-                "header": "Authorization",
-                "format": "Bearer {value}"
-            }
+            "hosts": ["api.openai.com"]
         }
     }
 
-    The "inject" field is optional (defaults to Authorization: Bearer).
     Placeholders are auto-generated at load time.
     """
     path = Path(config_path)
@@ -235,7 +226,6 @@ def load_config(
                 f"not a plain string. Secrets without host restrictions are not allowed."
             )
 
-        inject = entry_data.get("inject", {})
         placeholder = entry_data.get("placeholder", generate_placeholder(name))
 
         # Sanitize and validate hosts
@@ -251,8 +241,6 @@ def load_config(
             placeholder=placeholder,
             value=entry_data["value"],
             hosts=sanitized_hosts,
-            inject_header=inject.get("header", "Authorization"),
-            inject_format=inject.get("format", "Bearer {value}"),
         )
 
         config.secrets[name] = entry

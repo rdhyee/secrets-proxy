@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import shutil
 from pathlib import Path
 
 # mitmproxy's default CA cert location
