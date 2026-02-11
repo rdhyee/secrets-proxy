@@ -174,3 +174,52 @@ def test_startup_prints_recovery_hint(monkeypatch, tmp_path: Path, capsys) -> No
 
     assert rc == 0
     assert "If this process is killed with SIGKILL, run: secrets-proxy cleanup" in captured.out
+
+
+def test_run_does_not_leak_addon_env_to_sandbox(monkeypatch, tmp_path: Path) -> None:
+    class _FakeProc:
+        def __init__(self, returncode: int | None = None) -> None:
+            self.returncode = returncode
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: int | None = None) -> int:
+            del timeout
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self) -> None:
+            if self.returncode is None:
+                self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    captured_sandbox_env: dict[str, str] = {}
+    bundle_path = tmp_path / "ca-bundle.pem"
+    addon_path = tmp_path / "addon.py"
+    bundle_path.write_text("bundle")
+    addon_path.write_text("addon")
+
+    def fake_popen(cmd, env=None, **kwargs):
+        del cmd, kwargs
+        if env is not None:
+            captured_sandbox_env.update(env)
+        return _FakeProc(returncode=None)
+
+    monkeypatch.setenv("SECRETS_PROXY_CONFIG_JSON", "should-not-leak")
+    monkeypatch.setattr(launcher, "_check_mitmdump", lambda: None)
+    monkeypatch.setattr(launcher, "_generate_mitmproxy_ca_if_needed", lambda: None)
+    monkeypatch.setattr(launcher, "setup_ca_trust", lambda _: (bundle_path, {}))
+    monkeypatch.setattr(launcher, "_ADDON_ENTRY_PATH", str(addon_path))
+    monkeypatch.setattr(launcher, "_setup_nftables", lambda *_: False)
+    monkeypatch.setattr(launcher, "start_proxy", lambda *_, **__: _FakeProc(returncode=None))
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(launcher.signal, "signal", lambda *_: None)
+
+    rc = launcher.run(ProxyConfig(), ["echo", "hello"])
+
+    assert rc == 0
+    assert "SECRETS_PROXY_CONFIG_JSON" not in captured_sandbox_env

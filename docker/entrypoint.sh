@@ -143,15 +143,18 @@ trap cleanup EXIT
 echo "[secrets-proxy] Running as '$SANDBOX_USER': $*"
 echo "────────────────────────────────────────"
 
-# Source env vars and run as sandbox user
-su "$SANDBOX_USER" -c "
+# Source env vars and run as sandbox user without command-string interpolation.
+su "$SANDBOX_USER" -s /bin/bash -c '
+    set -euo pipefail
+    ca_bundle="$1"
+    shift
     source /tmp/sandbox_env.sh
-    export SSL_CERT_FILE=$CA_BUNDLE
-    export REQUESTS_CA_BUNDLE=$CA_BUNDLE
-    export NODE_EXTRA_CA_CERTS=$CA_BUNDLE
-    export CURL_CA_BUNDLE=$CA_BUNDLE
-    $*
-"
+    export SSL_CERT_FILE="$ca_bundle"
+    export REQUESTS_CA_BUNDLE="$ca_bundle"
+    export NODE_EXTRA_CA_CERTS="$ca_bundle"
+    export CURL_CA_BUNDLE="$ca_bundle"
+    exec "$@"
+' -- "$CA_BUNDLE" "$@"
 EXIT_CODE=$?
 
 echo "────────────────────────────────────────"
