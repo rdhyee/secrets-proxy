@@ -3,11 +3,120 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
+import re
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Valid environment variable name: starts with letter or underscore,
+# followed by letters, digits, or underscores.
+_VALID_SECRET_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def validate_secret_name(name: str) -> None:
+    """Validate that a secret name is safe for use as an environment variable.
+
+    Raises ValueError if the name contains shell metacharacters or is otherwise
+    not a valid POSIX environment variable name.
+    """
+    if not _VALID_SECRET_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid secret name {name!r}: must match [a-zA-Z_][a-zA-Z0-9_]* "
+            f"(no spaces, semicolons, or other shell metacharacters)"
+        )
+
+
+def _sanitize_host(host: str) -> str:
+    """Sanitize a hostname entry from config.
+
+    - Strip https:// and http:// prefixes
+    - Lowercase the hostname
+    - Strip trailing slashes and paths
+    - Strip port numbers
+    """
+    # Strip URL scheme prefixes
+    if host.startswith("https://"):
+        host = host[len("https://"):]
+    elif host.startswith("http://"):
+        host = host[len("http://"):]
+
+    # Strip trailing slashes and paths
+    host = host.split("/")[0]
+
+    # Strip port if present (but not for IPv6 bracket notation)
+    if ":" in host and not host.startswith("["):
+        host = host.rsplit(":", 1)[0]
+
+    # Lowercase
+    host = host.lower()
+
+    return host
+
+
+def _validate_host_pattern(pattern: str) -> None:
+    """Validate a host pattern.
+
+    Raises ValueError if the pattern is invalid:
+    - Wildcards must start with '*.' (not just '*')
+    - Hostname must use valid characters
+    """
+    if pattern.startswith("*"):
+        if not pattern.startswith("*."):
+            raise ValueError(
+                f"Invalid wildcard pattern '{pattern}': wildcards must start with '*.' "
+                f"(e.g., '*.example.com'), not just '*'."
+            )
+        # Validate the domain part after *.
+        domain_part = pattern[2:]
+        if not domain_part or ".." in domain_part:
+            raise ValueError(
+                f"Invalid wildcard pattern '{pattern}': domain part is invalid."
+            )
+
+    # Basic hostname validation for the non-wildcard portion
+    bare = pattern.lstrip("*.")
+    if bare and not re.match(r'^[a-z0-9]([a-z0-9\-\.]*[a-z0-9])?$', bare):
+        # Check if it's a valid IP address
+        try:
+            ipaddress.ip_address(bare)
+        except ValueError:
+            raise ValueError(
+                f"Invalid hostname pattern '{pattern}': contains invalid characters."
+            )
+
+
+def _is_ip_literal(host: str) -> bool:
+    """Check if a host string is an IP address literal (IPv4 or IPv6)."""
+    bare = host.strip("[]")
+    try:
+        ipaddress.ip_address(bare)
+        return True
+    except ValueError:
+        return False
+
+
+def _matches_host_pattern(host: str, pattern: str) -> bool:
+    """Check if a host matches a single pattern with strict dot-boundary matching.
+
+    Wildcard matching rules:
+    - *.github.com matches api.github.com (subdomain)
+    - *.github.com matches foo.bar.github.com (nested subdomain)
+    - *.github.com matches github.com (bare domain)
+    - *.github.com does NOT match github.com.evil.com (suffix trick)
+    """
+    if pattern.startswith("*."):
+        suffix = pattern[1:]  # .example.com
+        base_domain = pattern[2:]  # example.com
+        if host == base_domain:
+            return True
+        if host.endswith(suffix) and len(host) > len(suffix):
+            return True
+        return False
+    else:
+        return host == pattern
 
 
 @dataclass
@@ -22,14 +131,17 @@ class SecretEntry:
     inject_format: str = "Bearer {value}"
 
     def matches_host(self, host: str) -> bool:
-        """Check if a host is approved for this secret."""
+        """Check if a host is approved for this secret.
+
+        Wildcard matching is strict about dot boundaries:
+        - *.github.com matches api.github.com
+        - *.github.com matches foo.bar.github.com
+        - *.github.com does NOT match github.com.evil.com
+        - *.github.com also matches the bare github.com
+        """
+        host = host.lower()
         for pattern in self.hosts:
-            if pattern.startswith("*."):
-                # Wildcard: *.example.com matches foo.example.com
-                suffix = pattern[1:]  # .example.com
-                if host.endswith(suffix) or host == pattern[2:]:
-                    return True
-            elif host == pattern:
+            if _matches_host_pattern(host, pattern):
                 return True
         return False
 
@@ -41,6 +153,7 @@ class ProxyConfig:
     secrets: dict[str, SecretEntry] = field(default_factory=dict)
     allowed_hosts: set[str] = field(default_factory=set)
     proxy_port: int = 8080
+    allow_ip_literals: bool = False
     # All placeholder values, for quick lookup during substitution
     _placeholder_to_secret: dict[str, SecretEntry] = field(
         default_factory=dict, repr=False
@@ -60,6 +173,22 @@ class ProxyConfig:
                 found.append((placeholder, entry))
         return found
 
+    def is_host_allowed(self, host: str) -> bool:
+        """Check if a host is allowed by the allowlist.
+
+        Considers wildcard patterns, IP literal blocking, and exact matches.
+        """
+        host = host.lower()
+
+        # Block IP literals unless explicitly allowed
+        if _is_ip_literal(host) and not self.allow_ip_literals:
+            return False
+
+        for pattern in self.allowed_hosts:
+            if _matches_host_pattern(host, pattern):
+                return True
+        return False
+
 
 def generate_placeholder(name: str) -> str:
     """Generate a unique, recognizable placeholder for a secret."""
@@ -67,7 +196,11 @@ def generate_placeholder(name: str) -> str:
     return f"SECRETS_PROXY_PLACEHOLDER_{random_hex}"
 
 
-def load_config(config_path: str | Path, allow_net: list[str] | None = None) -> ProxyConfig:
+def load_config(
+    config_path: str | Path,
+    allow_net: list[str] | None = None,
+    allow_ip_literals: bool = False,
+) -> ProxyConfig:
     """Load secret configuration from a JSON file.
 
     Config format:
@@ -89,9 +222,11 @@ def load_config(config_path: str | Path, allow_net: list[str] | None = None) -> 
     with open(path) as f:
         raw = json.load(f)
 
-    config = ProxyConfig()
+    config = ProxyConfig(allow_ip_literals=allow_ip_literals)
 
     for name, entry_data in raw.items():
+        validate_secret_name(name)
+
         if isinstance(entry_data, str):
             # Simple format: {"OPENAI_API_KEY": "sk-real-key"}
             # No host restriction, no injection config
@@ -103,11 +238,19 @@ def load_config(config_path: str | Path, allow_net: list[str] | None = None) -> 
         inject = entry_data.get("inject", {})
         placeholder = entry_data.get("placeholder", generate_placeholder(name))
 
+        # Sanitize and validate hosts
+        raw_hosts = entry_data["hosts"]
+        sanitized_hosts = []
+        for h in raw_hosts:
+            h = _sanitize_host(h)
+            _validate_host_pattern(h)
+            sanitized_hosts.append(h)
+
         entry = SecretEntry(
             name=name,
             placeholder=placeholder,
             value=entry_data["value"],
-            hosts=entry_data["hosts"],
+            hosts=sanitized_hosts,
             inject_header=inject.get("header", "Authorization"),
             inject_format=inject.get("format", "Bearer {value}"),
         )
@@ -122,6 +265,8 @@ def load_config(config_path: str | Path, allow_net: list[str] | None = None) -> 
     # Add any extra allowed hosts (non-secret-bearing, but reachable)
     if allow_net:
         for host in allow_net:
+            host = _sanitize_host(host)
+            _validate_host_pattern(host)
             config.allowed_hosts.add(host)
 
     return config

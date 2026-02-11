@@ -108,10 +108,12 @@ ADDON_SCRIPT=$(mktemp /tmp/secrets_proxy_addon_XXXXXX.py)
 ENV_FILE=$(mktemp /tmp/secrets_proxy_env_XXXXXX.sh)
 
 python3 -c "
-import json, secrets, sys
+import json, re, secrets, sys
 
 config_path = sys.argv[1]
 allow_net_extra = sys.argv[2:]
+
+VALID_NAME_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
 with open(config_path) as f:
     raw = json.load(f)
@@ -121,6 +123,9 @@ env_lines = []
 allowed_hosts = set(allow_net_extra)
 
 for name, entry in raw.items():
+    if not VALID_NAME_RE.match(name):
+        print(f'Error: invalid secret name {name!r}: must match [a-zA-Z_][a-zA-Z0-9_]*', file=sys.stderr)
+        sys.exit(1)
     placeholder = f'SECRETS_PROXY_PLACEHOLDER_{secrets.token_hex(16)}'
     secrets_map[placeholder] = {
         'name': name,
